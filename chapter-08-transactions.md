@@ -1,5 +1,15 @@
 # Chapter 8: Transactions
 
+## TL;DR
+
+- **Transactions** group reads and writes into one logical unit that either fully commits or fully aborts — they collapse a large class of crash, network, and concurrency failures into a single safe retry.
+- **ACID** (atomicity, consistency, isolation, durability) is a vocabulary, not a contract — databases implement each letter differently, and "isolation" in particular has five or more common meanings.
+- **Weak isolation levels** (read committed, snapshot isolation) trade correctness for performance; only **serializable** isolation prevents all race conditions including lost updates, write skew, and phantoms.
+- **Serializability** can be implemented by literal serial execution, **2PL** (pessimistic), or **SSI** (optimistic); modern SSI makes it affordable.
+- **Distributed transactions** solve atomic commit across nodes via **2PC** (blocking, fragile under coordinator failure); prefer database-internal distributed transactions or idempotent message processing over heterogeneous XA.
+
+---
+
 ## Introduction
 
 In the real world, many things can go wrong when working with data:
@@ -11,7 +21,7 @@ In the real world, many things can go wrong when working with data:
 - A client may read data that doesn't make sense because it has only partially been updated
 - Race conditions between clients can cause surprising bugs
 
-For decades, **transactions** have been the mechanism of choice for simplifying these issues. A transaction is a way for an application to group several reads and writes together into a logical unit. Conceptually, all the reads and writes in a transaction are executed as one operation: either the entire transaction succeeds (commit) or it fails (abort, rollback). If it fails, the application can safely retry.
+For decades, **transactions** have been the mechanism of choice for simplifying these issues. A transaction is a way for an application to group several reads and writes together into a logical unit. Conceptually, all the reads and writes in a transaction are executed as one operation: either the entire transaction succeeds (**commit**) or it fails (**abort / rollback**). If it fails, the application can safely retry.
 
 ```mermaid
 graph LR
@@ -43,50 +53,23 @@ Almost all relational databases today, and some nonrelational databases, support
 
 In the late 2000s, nonrelational (NoSQL) databases started gaining popularity. They aimed to improve upon the relational status quo by offering a choice of new data models (see Chapter 3) and by including replication and sharding (discussed in Chapters 6 and 7) by default. Transactions were the main casualty of this movement: many of this generation of databases abandoned transactions entirely, or redefined the word to describe a much weaker set of guarantees than had previously been understood.
 
-The hype around NoSQL distributed databases led to a popular belief that transactions were fundamentally unscalable and that any large-scale system would have to abandon them in order to maintain good performance and high availability. More recently, that belief has turned out to be wrong. So-called "NewSQL" databases such as CockroachDB [5], TiDB [6], Spanner [7], FoundationDB [8], and YugabyteDB have shown that transactional systems can scale to large data volumes and high throughput.
+The hype around NoSQL distributed databases led to a popular belief that transactions were fundamentally unscalable and that any large-scale system would have to abandon them in order to maintain good performance and high availability. More recently, that belief has turned out to be wrong. So-called "NewSQL" databases such as CockroachDB [5], TiDB [6], Spanner [Corbett et al., 2013], FoundationDB [8], and YugabyteDB have shown that transactional systems can scale to large data volumes and high throughput.
 
 However, that doesn't mean that every system must be transactional either; as with every other technical design choice, transactions have advantages and limitations. The technical cause behind the Post Office Horizon scandal was probably a lack of ACID transactions in the underlying accounting system [1]. To understand those trade-offs, in this chapter we will explore the details of the guarantees that transactions can provide, both in normal operation and in various extreme (but realistic) circumstances.
 
----
+Transactions were created with a purpose — to simplify the programming model for applications accessing a database. Using transactions allows the application to ignore certain potential error scenarios and concurrency issues, because the database takes care of them instead (we call these **safety guarantees**). Not every application needs transactions, and sometimes there are advantages to weakening transactional guarantees or abandoning them entirely (e.g., to achieve better performance or higher availability). Some safety properties can be achieved without transactions.
 
-## What Exactly Is a Transaction?
-
-A transaction groups multiple reads and writes into a single logical operation. The transaction either fully succeeds (**commit**) or fails entirely (**abort / rollback**), so the application never sees a half-finished result. If it fails, the application can safely retry.
-
-```mermaid
-graph TB
-    A[BEGIN TRANSACTION]
-    R1[Read 1]
-    W1[Write 1]
-    R2[Read 2]
-    W2[Write 2]
-    D{Decision}
-    C[COMMIT<br/>All changes visible]
-    AB[ROLLBACK<br/>All changes discarded]
-
-    A --> R1 --> W1 --> R2 --> W2 --> D
-    D -->|All checks pass| C
-    D -->|Any failure| AB
-
-    style C fill:#90EE90
-    style AB fill:#ffcccc
-```
-
-Transactions are not a law of nature; they were created with a purpose—namely, to simplify the programming model for applications accessing a database. Using transactions allows the application to ignore certain potential error scenarios and concurrency issues, because the database takes care of them instead (we call these **safety guarantees**).
-
-Not every application needs transactions, and sometimes there are advantages to weakening transactional guarantees or abandoning them entirely (e.g., to achieve better performance or higher availability). Some safety properties can be achieved without transactions.
-
-How do you figure out whether you need transactions? To answer that question, we first need to understand the exact safety guarantees that transactions can provide and the costs associated with them. Although transactions seem straightforward at first glance, many subtle but important details come into play.
+Many subtle but important details come into play when choosing a transaction model. To answer whether you need transactions, you first need to understand the exact safety guarantees that transactions can provide and the costs associated with them.
 
 ---
 
 ## The Meaning of ACID
 
-The safety guarantees provided by transactions are often described by the well-known acronym **ACID**, which stands for **atomicity**, **consistency**, **isolation**, and **durability**. The term was coined in 1983 by Theo Härder and Andreas Reuter [9], in an effort to establish precise terminology for fault-tolerance mechanisms in databases.
+The safety guarantees provided by transactions are often described by the well-known acronym **ACID**, which stands for **atomicity**, **consistency**, **isolation**, and **durability**. The term was coined in 1983 by Theo Härder and Andreas Reuter [Härder & Reuter, 1983], in an effort to establish precise terminology for fault-tolerance mechanisms in databases.
 
 In practice, however, one database's implementation of ACID does not equal another's. For example, as we shall see, there is a lot of ambiguity around the meaning of isolation [10]. The high-level idea is sound, but the devil is in the details. Today, when a system claims to be "ACID compliant," it's unclear what guarantees you can actually expect. "ACID" has unfortunately become mostly a marketing term.
 
-Systems that do not meet the ACID criteria are sometimes called **BASE**, which stands for basically available, soft state, and eventual consistency [11]. This is even more vague than the definition of ACID. It seems that the only sensible definition of BASE is "not ACID" (i.e., it can mean almost anything you want).
+Systems that do not meet the ACID criteria are sometimes called **BASE**, which stands for basically available, soft state, and eventual consistency [Brewer, 2000]. This is even more vague than the definition of ACID. It seems that the only sensible definition of BASE is "not ACID" (i.e., it can mean almost anything you want).
 
 ```mermaid
 graph TB
@@ -113,7 +96,7 @@ graph TB
 
 In general, **atomic** refers to something that cannot be broken into smaller parts. The word means similar but subtly different things in different branches of computing. For example, in multithreaded programming, if one thread executes an atomic operation, that means there is no way that another thread could see the half-finished result of the operation. The system can be only in the state it was before the operation or after the operation, not something in between.
 
-By contrast, in the context of ACID, **atomicity is not about concurrency**. It does not describe what happens if several processes try to access the same data at the same time, because that is covered under the letter I, for isolation. Rather, ACID atomicity describes what happens if a client wants to make several writes, but a fault occurs after some of the writes have been processed—for example, a process crashes, a network connection is interrupted, a disk becomes full, or an integrity constraint is violated.
+By contrast, in the context of ACID, **atomicity is not about concurrency**. It does not describe what happens if several processes try to access the same data at the same time, because that is covered under the letter I, for isolation. Rather, ACID atomicity describes what happens if a client wants to make several writes, but a fault occurs after some of the writes have been processed — for example, a process crashes, a network connection is interrupted, a disk becomes full, or an integrity constraint is violated.
 
 If the writes are grouped together into an atomic transaction, and the transaction cannot be completed (committed) because of a fault, then the transaction is aborted and the database must discard or undo any writes it has made so far in that transaction.
 
@@ -143,17 +126,9 @@ sequenceDiagram
 
 ### 2. Consistency
 
-The word **consistency** is terribly overloaded:
+The word **consistency** is terribly overloaded — it has at least five common meanings across this book: replica consistency and eventual consistency (Chapter 6), consistent snapshots for backups (this chapter), consistent hashing (Chapter 7), and CAP-theorem consistency meaning linearizability (Chapters 9 and 10). In the context of ACID, **consistency refers to an application-specific notion of the database being in a "good state."**
 
-- In Chapter 6, we discussed replica consistency and the issue of eventual consistency that arises in asynchronously replicated systems.
-- A consistent snapshot of a database, such as for a backup, is a snapshot of the entire database as it existed at one moment in time.
-- Consistent hashing is an approach to sharding that some systems use for rebalancing (see Chapter 7).
-- In the CAP theorem (discussed in Chapter 10), the word consistency is used to mean linearizability.
-- In the context of ACID, **consistency refers to an application-specific notion of the database being in a "good state."**
-
-It's unfortunate that the same word has at least five meanings.
-
-The idea of ACID consistency is that you have certain statements about your data (**invariants**) that must always be true—for example, in an accounting system, credits and debits across all accounts must always be balanced. If a transaction starts with a database that is valid according to these invariants, and any writes during the transaction preserve the validity, then you can be sure that the invariants are always satisfied. (An invariant may be temporarily violated during transaction execution, but it should be satisfied again at transaction commit.)
+The idea of ACID consistency is that you have certain statements about your data (**invariants**) that must always be true — for example, in an accounting system, credits and debits across all accounts must always be balanced. If a transaction starts with a database that is valid according to these invariants, and any writes during the transaction preserve the validity, then you can be sure that the invariants are always satisfied. (An invariant may be temporarily violated during transaction execution, but it should be satisfied again at transaction commit.)
 
 If you want the database to enforce your invariants, you need to declare them as **constraints** as part of the schema. For example, foreign-key constraints, uniqueness constraints, and check constraints (which restrict the values that can appear in an individual row) are often used to model specific types of invariants. More complex consistency requirements can sometimes be modeled using triggers or materialized views [12].
 
@@ -222,7 +197,7 @@ sequenceDiagram
 
 **Isolation** in the sense of ACID means that concurrently executing transactions are isolated from each other; they cannot step on each other's toes. The classic database textbooks formalize isolation as **serializability**, which means that each transaction can pretend that it is the only transaction running on the entire database. The database ensures that when the transactions have committed, the result is the same as if they had run serially (one after another), even though in reality they may have run concurrently [13].
 
-However, serializability has a performance cost. In practice, many databases use forms of isolation that are weaker than serializability—that is, they allow concurrent transactions to interfere with each other in limited ways. Some popular databases, such as Oracle, don't even implement it (Oracle has an isolation level called "serializable," but it actually implements snapshot isolation, which is a weaker guarantee than serializability [10, 14]).
+However, serializability has a performance cost. In practice, many databases use forms of isolation that are weaker than serializability — that is, they allow concurrent transactions to interfere with each other in limited ways. Some popular databases, such as Oracle, don't even implement it (Oracle has an isolation level called "serializable," but it actually implements snapshot isolation, which is a weaker guarantee than serializability [10, 14]).
 
 ### 4. Durability
 
@@ -255,16 +230,16 @@ In a replicated database, durability may mean that the data has been successfull
 Historically, durability meant writing to an archive tape. Then it was understood as writing to a disk or SSD. More recently, it has been adapted to mean replication. The truth is, nothing is perfect:
 
 - If you write to disk and the machine dies, even though your data isn't lost, it is inaccessible until you either fix the machine or transfer the disk to another machine. Replicated systems can remain available.
-- A correlated fault—say, a power outage, or a bug that crashes every node on a particular input—can knock out all replicas at once, causing any data that is only in memory to be lost.
+- A correlated fault — say, a power outage, or a bug that crashes every node on a particular input — can knock out all replicas at once, causing any data that is only in memory to be lost.
 - In an asynchronously replicated system, recent writes may be lost when the leader becomes unavailable.
-- When the power is suddenly cut, SSDs in particular have been shown to sometimes violate the guarantees they are supposed to provide; even `fsync` isn't guaranteed to work correctly [15]. Disk firmware can have bugs—just like any other kind of software [16, 17, 18].
+- When the power is suddenly cut, SSDs in particular have been shown to sometimes violate the guarantees they are supposed to provide; even `fsync` isn't guaranteed to work correctly [15]. Disk firmware can have bugs — just like any other kind of software [16, 17, 18].
 - Even PostgreSQL used `fsync` incorrectly for over 20 years [19, 20, 21].
 - Subtle interactions between the storage engine and the filesystem implementation can lead to bugs that are hard to track down and may cause files on disk to be corrupted after a crash [22, 23]. Filesystem errors on one replica can sometimes spread to other replicas as well [24].
 - Data on disk can gradually become corrupted without this being detected [25, 26]. If data has been corrupted for some time, replicas and recent backups may also be corrupted.
 - One study of SSDs found that **30% to 80% of drives develop at least one bad block during the first four years of operation**, and only some of these can be corrected by the firmware [27].
 - When a worn-out SSD is disconnected from power, it can start losing data within a timescale of weeks to months, depending on the temperature [28].
 
-In practice, no one technique can provide absolute guarantees. There are only various risk-reduction techniques—including writing to disk, replicating to remote machines, and backups—and they can and should be used together.
+In practice, no one technique can provide absolute guarantees. There are only various risk-reduction techniques — including writing to disk, replicating to remote machines, and backups — and they can and should be used together.
 
 ```python
 # Demonstrate durability trade-offs in a simplified transaction log
@@ -314,11 +289,6 @@ print(f"Weak durability:   {(time.time() - start):.2f}s")
 
 ## Single-Object and Multi-Object Operations
 
-To recap, in ACID, atomicity and isolation describe what the database should do if a client makes several writes within the same transaction:
-
-- **Atomicity** — If an error occurs halfway through a sequence of writes, the transaction should be aborted, and the writes made up to that point should be discarded.
-- **Isolation** — Concurrently running transactions shouldn't interfere with each other. For example, if one transaction makes several writes, then another transaction should see either all or none of those writes, but not a subset.
-
 These definitions assume that you want to modify several objects (rows, documents, records) at once. Such **multi-object transactions** are often needed if several pieces of data need to be kept in sync.
 
 ```mermaid
@@ -367,7 +337,7 @@ Atomicity and isolation also apply when a single object is being changed. For ex
 
 Each of those outcomes would be incredibly confusing, so storage engines almost universally aim to provide atomicity and isolation on the level of a single object (such as a key-value pair) on one node. Atomicity can be implemented using a log for crash recovery, and isolation can be implemented using a lock on each object (allowing only one thread to access an object at any one time).
 
-Some databases also provide more complex atomic operations, such as an increment operation, which removes the need for a read-modify-write cycle. Similarly popular is a **conditional write operation**, which allows a write to happen only if the value has not been concurrently changed by someone else—similar to a compare-and-set (CAS) operation in shared-memory concurrency.
+Some databases also provide more complex atomic operations, such as an increment operation, which removes the need for a read-modify-write cycle. Similarly popular is a **conditional write operation**, which allows a write to happen only if the value has not been concurrently changed by someone else — similar to a compare-and-set (CAS) operation in shared-memory concurrency.
 
 > Strictly speaking, the term "atomic increment" uses the word atomic in the sense of multithreaded programming. In the context of ACID, it should be called an isolated or serializable increment, but that's not the usual term.
 
@@ -381,7 +351,7 @@ In some use cases, single-object inserts, updates, and deletes are sufficient. H
 
 - **Relational data model**: A row in one table often has a foreign-key reference to a row in another table. Similarly, in a graph-like data model, a vertex has edges to other vertices. Multi-object transactions allow you to ensure that these references remain valid.
 - **Document data model**: The fields that need to be updated together are often within the same document, which is treated as a single object. However, document databases lacking join functionality also encourage denormalization. When denormalized information needs to be updated, you need to update several documents in one go.
-- **Secondary indexes**: In databases with secondary indexes (almost everything except pure key-value stores), the indexes also need to be updated every time you change a value. These indexes are different database objects from a transaction point of view—for example, without transaction isolation, it's possible for a record to appear in one index but not another.
+- **Secondary indexes**: In databases with secondary indexes (almost everything except pure key-value stores), the indexes also need to be updated every time you change a value. These indexes are different database objects from a transaction point of view — for example, without transaction isolation, it's possible for a record to appear in one index but not another.
 
 Such applications can still be implemented without transactions. However, error handling becomes much more complicated without atomicity, and the lack of isolation can cause concurrency problems.
 
@@ -389,9 +359,9 @@ Such applications can still be implemented without transactions. However, error 
 
 A key feature of a transaction is that it can be aborted and safely retried if an error occurs. ACID databases are based on this philosophy: if the database is in danger of violating its guarantee of atomicity, isolation, or durability, it would rather abandon the transaction entirely than allow it to remain half-finished.
 
-Not all systems follow that philosophy, though. In particular, datastores with leaderless replication work on more of a "best effort" basis, which can be summarized as "the database will do as much as it can, and if it runs into an error, it won't undo something it has already done"—so it's the application's responsibility to recover from errors.
+Not all systems follow that philosophy, though. In particular, datastores with leaderless replication work on more of a "best effort" basis, which can be summarized as "the database will do as much as it can, and if it runs into an error, it won't undo something it has already done" — so it's the application's responsibility to recover from errors.
 
-Errors will inevitably happen, but many software developers prefer to think only about the happy path rather than the intricacies of error handling. For example, popular object-relational mapping (ORM) frameworks such as Rails ActiveRecord and Django don't retry aborted transactions—the error usually results in an exception bubbling up the stack, so any user input is thrown away, and the user gets an error message. This is a shame, because the whole point of rolling back transactions is to enable safe retries.
+Errors will inevitably happen, but many software developers prefer to think only about the happy path rather than the intricacies of error handling. For example, popular object-relational mapping (ORM) frameworks such as Rails ActiveRecord and Django don't retry aborted transactions — the error usually results in an exception bubbling up the stack, so any user input is thrown away, and the user gets an error message. This is a shame, because the whole point of rolling back transactions is to enable safe retries.
 
 ```python
 # A reusable retry helper that handles transient transaction errors
@@ -472,7 +442,7 @@ graph LR
 
 In practice, isolation is unfortunately not that simple. Serializable isolation has a performance cost, and many databases don't want to pay that price [10]. Therefore, systems commonly use weaker levels of isolation, which protect against some concurrency issues but not all. Those levels of isolation are much harder to understand and can lead to subtle bugs, but they are nevertheless used in practice [30].
 
-Concurrency bugs caused by weak transaction isolation and race conditions are not just a theoretical problem. They have caused substantial loss of money, including bankrupting a Bitcoin exchange [31, 32, 33, 34], led to investigation by financial auditors [35], and caused customer data to be corrupted [36]. A popular comment on revelations of such problems is "Use an ACID database if you're handling financial data!"—but that misses the point. Even many popular relational database systems (which are usually considered ACID) use weak isolation, so they wouldn't necessarily have prevented these bugs from occurring.
+Concurrency bugs caused by weak transaction isolation and race conditions are not just a theoretical problem. They have caused substantial loss of money, including bankrupting a Bitcoin exchange [31, 32, 33, 34], led to investigation by financial auditors [35], and caused customer data to be corrupted [36]. A popular comment on revelations of such problems is "Use an ACID database if you're handling financial data!" — but that misses the point. Even many popular relational database systems (which are usually considered ACID) use weak isolation, so they wouldn't necessarily have prevented these bugs from occurring.
 
 Those examples also highlight an important point: even if concurrency issues are rare in normal operation, you have to consider the possibility that an attacker might deliberately send a burst of highly concurrent requests to your API in an attempt to exploit concurrency bugs [32]. Therefore, to build applications that are reliable and secure, you have to ensure that such bugs are systematically prevented.
 
@@ -487,9 +457,7 @@ The most basic level of transaction isolation is **read committed**, and it make
 
 #### No Dirty Reads
 
-Imagine a transaction has written some data to the database, but the transaction has not yet committed or aborted. Can another transaction see that uncommitted data? If so, that's called a **dirty read** [3].
-
-Transactions running at the read-committed isolation level must prevent dirty reads. This means that any writes by a transaction become visible to others only when that transaction commits (and then all its writes become visible at once).
+Imagine a transaction has written some data to the database, but the transaction has not yet committed or aborted. Can another transaction see that uncommitted data? If so, that's called a **dirty read** [3]. Read committed means any writes by a transaction become visible to others only when that transaction commits.
 
 ```mermaid
 sequenceDiagram
@@ -513,16 +481,14 @@ sequenceDiagram
     DB->>U2: 3 (now visible)
 ```
 
-Preventing dirty reads is useful for a few reasons:
+Two reasons preventing dirty reads is useful:
 
-- If a transaction needs to update several rows, a dirty read means that another transaction may see some of the updates but not others. Seeing the database in a partially updated state is confusing to users and may cause other transactions to make incorrect decisions.
-- If a transaction aborts, any writes it has made need to be rolled back. If the database allows dirty reads, a transaction may see data that is later rolled back—that is, data that is never actually committed to the database. Any transaction that read uncommitted data would also need to be aborted, leading to a problem called **cascading aborts**.
+- A dirty read means another transaction may see some updates but not others, exposing a partially updated state that is confusing and may drive incorrect decisions.
+- If a transaction aborts, any reads of its uncommitted data would also need to be aborted — a **cascading abort**.
 
 #### No Dirty Writes
 
-What happens if two transactions concurrently try to update the same row in a database? We don't know in which order the writes will happen, but we normally assume that the later write overwrites the earlier one.
-
-However, what happens if the earlier write is part of a transaction that has not yet committed, so the later write overwrites an uncommitted value? This is called a **dirty write** [38]. Transactions running at the read-committed isolation level must prevent dirty writes, usually by delaying the second write until the first write's transaction has committed or aborted.
+If two transactions concurrently try to update the same row, the later write normally overwrites the earlier one. But if the earlier write is part of a transaction that has not yet committed, this is a **dirty write** [Berenson et al., 1995]. Read committed prevents dirty writes, usually by delaying the second write until the first transaction has committed or aborted.
 
 ```mermaid
 sequenceDiagram
@@ -550,10 +516,7 @@ sequenceDiagram
     Note over DB: ✓ owner='Bryce', invoice='Bryce'<br/>(consistent — without dirty-write prevention,<br/>owner could be Bryce but invoice to Aaliyah)
 ```
 
-By preventing dirty writes, this isolation level avoids some kinds of concurrency problems:
-
-- If transactions update multiple rows, dirty writes can lead to a bad outcome. For example, on a used car sales website where two people, Aaliyah and Bryce, are simultaneously trying to buy the same car. Buying a car requires two database writes: the listing on the website needs to be updated to reflect the buyer, and the sales invoice needs to be sent to the buyer. Without prevention, the sale could be awarded to Bryce (because he performs the winning update to the listings table), but the invoice could be sent to Aaliyah (because she performs the winning update to the invoices table).
-- However, read-committed isolation does not prevent the race condition between two counter increments (the lost update problem). The second write happens after the first transaction has committed, so it's not a dirty write. It's still incorrect, but for a different reason.
+By preventing dirty writes, read committed avoids some bad outcomes — for example, a car sale being awarded to Bryce (winning update to the listings table) while the invoice goes to Aaliyah (winning update to the invoices table). Note: read committed does **not** prevent the lost-update problem, which is a race between committed writes, not a dirty write.
 
 #### Implementing Read Committed
 
@@ -638,7 +601,7 @@ In Aaliyah's case, this is not a lasting problem, because she will most likely s
 - **Backups** — Taking a backup requires making a copy of the entire database, which may take hours for a large database. During the time that the backup process is running, writes will continue to be made to the database. Thus, you could end up with some parts of the backup containing an older version of the data and other parts containing a newer version.
 - **Analytical queries and integrity checks** — Sometimes you may want to run a query that scans over large parts of the database. Such queries are common in analytics, or they may be part of a periodic integrity check. These queries are likely to return nonsensical results if they observe parts of the database at different points in time.
 
-**Snapshot isolation** [38] is the most common solution to this problem. The idea is that each transaction reads from a consistent snapshot of the database—that is, it sees all the data that was committed in the database at the start of that transaction. Even if the data is subsequently changed by another transaction, each transaction sees only the old data from that particular point in time.
+**Snapshot isolation** [Berenson et al., 1995] is the most common solution to this problem. Each transaction reads from a consistent snapshot of the database — that is, it sees all the data that was committed in the database at the start of that transaction. Even if the data is subsequently changed by another transaction, each transaction sees only the old data from that particular point in time.
 
 Snapshot isolation is a boon for long-running, read-only queries such as backups and analytics. Snapshot isolation is a popular feature: variants of it are supported by PostgreSQL, MySQL with the InnoDB storage engine, Oracle, SQL Server, and others, although the detailed behavior varies from one system to the next [30, 42, 43]. Some databases, such as Oracle, TiDB, and Aurora DSQL, even choose snapshot isolation as their highest isolation level.
 
@@ -667,7 +630,7 @@ graph TB
     style V2 fill:#ffcccc
 ```
 
-Figure illustrates how MVCC-based snapshot isolation is implemented in PostgreSQL [42, 44, 45] (other implementations are similar). When a transaction is started, it is given a unique, always-increasing transaction ID (txid). Whenever a transaction writes anything to the database, the data it writes is tagged with the transaction ID of the writer. (Transaction IDs in PostgreSQL are 32-bit integers, so they overflow after approximately 4 billion transactions. The vacuum process performs cleanup to ensure that overflow does not affect the data.)
+The figure illustrates how MVCC-based snapshot isolation is implemented in PostgreSQL [42, 44, 45] (other implementations are similar). When a transaction is started, it is given a unique, always-increasing transaction ID (txid). Whenever a transaction writes anything to the database, the data it writes is tagged with the transaction ID of the writer. (Transaction IDs in PostgreSQL are 32-bit integers, so they overflow after approximately 4 billion transactions. The vacuum process performs cleanup to ensure that overflow does not affect the data.)
 
 Each row in a table has an `inserted_by` field, containing the ID of the transaction that inserted that row into the table. Each row also has a `deleted_by` field, which is initially empty. If a transaction deletes a row, the row isn't removed from the database but instead is marked for deletion by setting the `deleted_by` field to the ID of the transaction that requested the deletion. At a later time, when it is certain that no transaction can any longer access the deleted or overwritten data, a garbage collection (GC) process in the database removes any rows marked for deletion and frees their space.
 
@@ -756,19 +719,13 @@ print(f"acct_2 = {db.read(t12, 'acct_2')}")   # 500 (her snapshot — no skew!)
 db.commit(t12)
 ```
 
-#### Visibility Rules for Observing a Consistent Snapshot
+#### Visibility Rules for a Consistent Snapshot
 
-When a transaction reads from the database, transaction IDs are used to decide which row versions it can see and which are invisible. By carefully defining visibility rules, the database can present a consistent snapshot of its contents to the application. This works roughly as follows [45]:
+When a transaction reads from the database, transaction IDs are used to decide which row versions it can see and which are invisible. By carefully defining visibility rules, the database can present a consistent snapshot of its contents to the application [45]:
 
-1. At the start of each transaction, the database makes a list of all the other transactions that are in progress (not yet committed or aborted) at that time. Any writes that those transactions have made are ignored, even if the transactions subsequently commit. This ensures that the application sees a consistent snapshot that is not affected by another transaction committing.
-2. Any writes made by transactions with a later transaction ID (i.e., which started after the current transaction started, and which are therefore not included in the list of in-progress transactions) are ignored, regardless of whether those transactions have committed.
-3. Any writes made by aborted transactions are ignored, regardless of when the abort happened. This has the advantage that when a transaction aborts, we don't need to immediately remove the rows it wrote from storage, since the visibility rule filters them out.
-4. All other writes are visible to the application's queries.
-
-Put another way, a row is visible if both of the following conditions are true:
-
-- At the time when the reader's transaction started, the transaction that inserted the row had already committed.
-- The row is not marked for deletion, or if it is, the transaction that requested deletion had not yet committed at the time when the reader's transaction started.
+- A row is visible to a reader's transaction if both of the following are true: at the time when the reader's transaction started, the transaction that inserted the row had already committed; and the row is not marked for deletion, or it was marked for deletion by a transaction that had not yet committed at the time when the reader's transaction started.
+- Practically, at the start of each transaction the database records the in-progress transactions; writes by those transactions (and any later transactions) are ignored, regardless of whether they subsequently commit. Writes by aborted transactions are also ignored (so we don't need to immediately remove aborted writes from storage — the visibility rule filters them out).
+- All other writes are visible.
 
 #### Indexes and Snapshot Isolation
 
@@ -778,20 +735,20 @@ Another approach is used in CouchDB, Datomic, and LMDB. Although they also use B
 
 #### Snapshot Isolation, Repeatable Read, and Naming Confusion
 
-MVCC is a commonly used implementation technique for databases, and often it is used to implement snapshot isolation. However, different databases sometimes use different terms to refer to the same thing—for example, **snapshot isolation is called "repeatable read" in PostgreSQL and "serializable" in Oracle** [30]. Sometimes different systems use the same term but with a different meaning—for example, while in PostgreSQL "repeatable read" means snapshot isolation, in MySQL it means an implementation of MVCC with weaker consistency than snapshot isolation [43], and IBM Db2 uses "repeatable read" to refer to serializability [10].
+MVCC is a commonly used implementation technique for databases, and often it is used to implement snapshot isolation. However, different databases sometimes use different terms to refer to the same thing — for example, **snapshot isolation is called "repeatable read" in PostgreSQL and "serializable" in Oracle** [30]. Sometimes different systems use the same term but with a different meaning — for example, while in PostgreSQL "repeatable read" means snapshot isolation, in MySQL it means an implementation of MVCC with weaker consistency than snapshot isolation [43], and IBM Db2 uses "repeatable read" to refer to serializability [10].
 
-The reason for this naming confusion is that the SQL standard doesn't have the concept of snapshot isolation, because the standard is based on System R's 1975 definition of isolation levels [3] and snapshot isolation hadn't yet been invented then. Unfortunately, the SQL standard's definition of isolation levels is flawed—it is ambiguous, imprecise, and not as implementation-independent as a standard should be [38].
+The reason for this naming confusion is that the SQL standard doesn't have the concept of snapshot isolation, because the standard is based on System R's 1975 definition of isolation levels [3] and snapshot isolation hadn't yet been invented then. Unfortunately, the SQL standard's definition of isolation levels is flawed — it is ambiguous, imprecise, and not as implementation-independent as a standard should be [Berenson et al., 1995].
 
 ### Preventing Lost Updates
 
-Our discussion of the read-committed and snapshot isolation levels has primarily focused on guarantees about what a read-only transaction can see in the presence of concurrent writes. We have mostly ignored the issue of two transactions writing concurrently—we have discussed only dirty writes, one particular type of write-write conflict that can occur.
+Our discussion of the read-committed and snapshot isolation levels has primarily focused on guarantees about what a read-only transaction can see in the presence of concurrent writes. We have mostly ignored the issue of two transactions writing concurrently — we have discussed only dirty writes, one particular type of write-write conflict that can occur.
 
 Several other interesting kinds of conflicts can occur between concurrently writing transactions. The best known of these is the **lost update** problem. The lost update problem can occur if an application reads a value from the database, modifies it, and writes back the modified value (the read-modify-write cycle mentioned earlier). If two transactions do this concurrently, one of the modifications can be lost.
 
 This pattern occurs in various scenarios, such as:
 
 - Incrementing a counter or updating an account balance
-- Making a local change to a complex value—for example, adding an element to a list within a JSON document
+- Making a local change to a complex value — for example, adding an element to a list within a JSON document
 - Two users editing a wiki page at the same time
 
 Because this is such a common problem, a variety of solutions have been developed [50].
@@ -952,7 +909,7 @@ sequenceDiagram
 
 **Characterizing Write Skew**
 
-This anomaly is called **write skew** [38]. It is neither a dirty write nor a lost update, because the two transactions are updating two objects (Aaliyah's and Bryce's on-call records, respectively). It is less obvious that a conflict occurred here, but it's definitely a race condition: if the two transactions had run one after another, the second doctor would have been prevented from going off call.
+This anomaly is called **write skew** [Berenson et al., 1995]. It is neither a dirty write nor a lost update, because the two transactions are updating two objects (Aaliyah's and Bryce's on-call records, respectively). It is less obvious that a conflict occurred here, but it's definitely a race condition: if the two transactions had run one after another, the second doctor would have been prevented from going off call.
 
 You can think of write skew as a generalization of the lost-update problem. Write skew can occur if two transactions read the same objects and then update some of those objects (different transactions may update different objects). In the special case of different transactions updating the same object, you get a dirty write or lost update anomaly (depending on the timing).
 
@@ -995,7 +952,7 @@ print(f"❌ INVARIANT VIOLATED: {sum(db.on_call.values())} doctors on call")
 With write skew, our options are more restricted:
 
 - Atomic single-object operations don't help, as multiple objects are involved.
-- The automatic detection of lost updates that you find in some implementations of snapshot isolation unfortunately doesn't help either—write skew is not automatically detected in PostgreSQL's repeatable read, MySQL/InnoDB's repeatable read, Oracle's serializable, or SQL Server's snapshot isolation level [30]. Automatically preventing write skew requires true serializable isolation.
+- The automatic detection of lost updates that you find in some implementations of snapshot isolation unfortunately doesn't help either — write skew is not automatically detected in PostgreSQL's repeatable read, MySQL/InnoDB's repeatable read, Oracle's serializable, or SQL Server's snapshot isolation level [30]. Automatically preventing write skew requires true serializable isolation.
 - If you can't use a serializable isolation level, the second-best option is probably to explicitly lock the rows that the transaction depends on.
 
 ```sql
@@ -1048,12 +1005,12 @@ In this chapter we have seen several examples of transactions that are prone to 
 The isolation level situation is messy:
 
 - Isolation levels are hard to understand and inconsistently implemented in different databases (e.g., the meaning of "repeatable read" varies significantly).
-- It can be difficult to tell by looking at the application code whether it is safe to run at a particular isolation level—especially in a large application, where you might not be aware of all the things that may be happening concurrently.
+- It can be difficult to tell by looking at the application code whether it is safe to run at a particular isolation level — especially in a large application, where you might not be aware of all the things that may be happening concurrently.
 - There are no good tools to help us detect race conditions.
 
 This is not a new problem. It has been like this since the 1970s. All along, the answer from researchers has been simple: use serializable isolation!
 
-**Serializable isolation** is the strongest isolation level. It guarantees that even though transactions may execute in parallel, the end result is the same as if they had executed one at a time, serially, without any concurrency. Thus, the database guarantees that if the transactions behave correctly when run individually, they continue to do so when run concurrently—in other words, the database prevents all possible race conditions.
+**Serializable isolation** is the strongest isolation level. It guarantees that even though transactions may execute in parallel, the end result is the same as if they had executed one at a time, serially, without any concurrency. Thus, the database guarantees that if the transactions behave correctly when run individually, they continue to do so when run concurrently — the database prevents all possible race conditions.
 
 But if serializable isolation is so much better than the mess of weak isolation levels, why isn't everyone using it? To answer this question, we need to look at the options for implementing serializability and how they perform. Most databases that provide serializability today use one of three techniques, which we will explore in the rest of this chapter:
 
@@ -1272,9 +1229,9 @@ If there is no suitable index where a range lock can be attached, the database c
 
 This chapter has painted a bleak picture of concurrency control in databases. On the one hand, we have implementations of serializability that don't perform well (2PL) or don't scale well (serial execution). On the other hand, we have weak isolation levels that have good performance but are prone to various race conditions. Are serializable isolation and good performance fundamentally at odds with each other?
 
-It seems not: an algorithm called **serializable snapshot isolation (SSI)** provides full serializability with only a small performance penalty compared to snapshot isolation. SSI is comparatively new; it was first described in 2008 [55, 67].
+It seems not: an algorithm called **serializable snapshot isolation (SSI)** provides full serializability with only a small performance penalty compared to snapshot isolation. SSI is comparatively new; it was first described in 2008 [Cahill et al., 2008].
 
-Today, SSI and similar algorithms are used in single-node databases (the serializable isolation level in PostgreSQL [56], SQL Server's In-Memory OLTP/Hekaton [68], and HyPer [69]), distributed databases (CockroachDB [5] and FoundationDB [8]), and embedded storage engines such as BadgerDB.
+Today, SSI and similar algorithms are used in single-node databases (the serializable isolation level in PostgreSQL [Ports & Grittner, 2012], SQL Server's In-Memory OLTP/Hekaton [Larson et al., 2013], and HyPer [Neumann et al., 2015]), distributed databases (CockroachDB [5] and FoundationDB [8]), and embedded storage engines such as BadgerDB.
 
 #### Pessimistic vs. Optimistic Concurrency Control
 
@@ -1323,7 +1280,7 @@ Optimistic concurrency control performs badly if there is high contention (many 
 
 When we previously discussed write skew in snapshot isolation, we observed a recurring pattern: a transaction reads data from the database, examines the result of the query, and decides to take an action based on the result that it saw. However, under snapshot isolation, the result from the original query may no longer be up-to-date by the time the transaction commits, because the data may have been modified in the meantime.
 
-Put another way, the transaction is taking an action based on a premise (a fact that was true at the beginning of the transaction). Later, when the transaction wants to commit, the original data may have changed—the premise may no longer be true.
+Put another way, the transaction is taking an action based on a premise (a fact that was true at the beginning of the transaction). Later, when the transaction wants to commit, the original data may have changed — the premise may no longer be true.
 
 When the application makes a query, the database doesn't know how the application logic uses the result of that query. To be safe, the database needs to assume that any change in the query result (the premise) means that writes in that transaction may be invalid. To provide serializable isolation, the database must detect situations in which a transaction may have acted on an outdated premise and abort the transaction in that case.
 
@@ -1384,7 +1341,7 @@ graph TB
 
 Compared to 2PL, the big advantage of serializable snapshot isolation is that one transaction doesn't need to block waiting for locks held by another transaction. As with snapshot isolation, writers don't block readers, and vice versa. This design principle makes query latency much more predictable and less variable. In particular, read-only queries can run on a consistent snapshot without requiring any locks.
 
-Compared to serial execution, serializable snapshot isolation is not limited to the throughput of a single CPU core—for example, FoundationDB distributes the detection of serialization conflicts across multiple machines.
+Compared to serial execution, serializable snapshot isolation is not limited to the throughput of a single CPU core — for example, FoundationDB distributes the detection of serialization conflicts across multiple machines.
 
 Compared to nonserializable snapshot isolation, the need to check for serializability violations introduces some performance overheads.
 
@@ -1436,7 +1393,7 @@ If some nodes commit the transaction but others abort it, the nodes become incon
 
 ### Two-Phase Commit (2PC)
 
-Two-phase commit is an algorithm for achieving atomic transaction commit across multiple nodes. It is a classic algorithm in distributed databases [13, 73, 74]. 2PC is used internally in some databases and also made available to applications in the form of XA transactions [75] (which are supported by the Java Transaction API, for example) or via WS-AtomicTransaction for SOAP web services [76, 77].
+Two-phase commit is an algorithm for achieving atomic transaction commit across multiple nodes. It is a classic algorithm in distributed databases [Gray, 1978]. 2PC is used internally in some databases and also made available to applications in the form of XA transactions [X/Open, 1991] (which are supported by the Java Transaction API, for example) or via WS-AtomicTransaction for SOAP web services [76, 77].
 
 2PC uses a new component that does not normally appear in single-node transactions: a **coordinator** (also known as **transaction manager**). The coordinator is often implemented as a library within the same application process that is requesting the transaction (e.g., embedded in a Java EE container), but it can also be a separate process or service. Examples of such coordinators include Narayana, JOTM, BTM, and MSDTC.
 
@@ -1572,7 +1529,7 @@ class TwoPhaseCommitParticipant:
 
 We have discussed what happens if one of the participants or the network fails during 2PC. However, it is less clear what happens if the coordinator crashes.
 
-If the coordinator fails before sending the prepare requests, a participant can safely abort the transaction. But once the participant has received a prepare request and voted yes, it can no longer abort unilaterally—it must wait to hear back from the coordinator. A participant's transaction in this state is called **in doubt** or **uncertain**.
+If the coordinator fails before sending the prepare requests, a participant can safely abort the transaction. But once the participant has received a prepare request and voted yes, it can no longer abort unilaterally — it must wait to hear back from the coordinator. A participant's transaction in this state is called **in doubt** or **uncertain**.
 
 ```mermaid
 sequenceDiagram
@@ -1604,9 +1561,9 @@ Furthermore, if the coordinator's disk fails and its log is lost, the system has
 
 2PC is called a **blocking atomic commit protocol** because 2PC can become stuck waiting for the coordinator to recover. It is possible to make an atomic commit protocol nonblocking, so that it does not get stuck if a node fails.
 
-As an alternative to 2PC, an algorithm called **three-phase commit (3PC)** has been proposed [13, 79]. However, 3PC assumes a network with bounded delay and nodes with bounded response times; in most practical systems with unbounded network delay and process pauses (see Chapter 9), 3PC cannot guarantee atomicity. A better solution in practice is to replace the single-node coordinator with a fault-tolerant consensus protocol.
+As an alternative to 2PC, an algorithm called **three-phase commit (3PC)** has been proposed [Skeen, 1981]. However, 3PC assumes a network with bounded delay and nodes with bounded response times; in most practical systems with unbounded network delay and process pauses (see Chapter 9), 3PC cannot guarantee atomicity. A better solution in practice is to replace the single-node coordinator with a fault-tolerant consensus protocol.
 
-### Distributed Transactions Across Different Systems
+### XA Transactions: Heterogeneous Distributed Transactions
 
 Distributed transactions and 2PC have a mixed reputation. On the one hand, they are seen as providing an important safety guarantee that would be hard to achieve otherwise; on the other hand, they are criticized for causing operational problems, killing performance, and promising more than they can deliver [80, 81, 82, 83]. Many cloud services choose not to implement distributed transactions because of the operational problems they engender [84].
 
@@ -1615,45 +1572,29 @@ Some implementations of distributed transactions carry a heavy performance penal
 To begin, we should be precise about what we mean by "distributed transactions." Two quite different types of distributed transactions are often conflated:
 
 - **Database-internal distributed transactions** — Some distributed databases (i.e., databases that use replication and sharding in their standard configuration) support internal transactions among the nodes of that database. For example, YugabyteDB, TiDB, FoundationDB, Spanner, VoltDB, Cassandra, and MySQL Cluster's NDB storage engine have such internal transaction support. In this case, all the nodes participating in the transaction are running the same database software.
-- **Heterogeneous distributed transactions** — In a heterogeneous transaction, the participants are two or more technologies—for example, two databases from different vendors, or even non-database systems such as message brokers. A distributed transaction across these systems must ensure atomic commit, even though the systems may be entirely different under the hood.
+- **Heterogeneous distributed transactions** — In a heterogeneous transaction, the participants are two or more technologies — for example, two databases from different vendors, or even non-database systems such as message brokers. A distributed transaction across these systems must ensure atomic commit, even though the systems may be entirely different under the hood.
 
 Database-internal transactions do not have to be compatible with any other system, so they can use any protocol and apply optimizations specific to that particular technology. For that reason, database-internal distributed transactions can often work quite well. On the other hand, transactions spanning heterogeneous technologies are a lot more challenging.
 
-#### Exactly-Once Message Processing
-
-Heterogeneous distributed transactions allow diverse systems to be integrated in powerful ways. For example, a message from a message queue can be acknowledged as processed if and only if the database transaction for processing the message was successfully committed. This is implemented by atomically committing the message acknowledgment and the database writes in a single transaction.
-
-If either the message delivery or the database transaction fails, both are aborted so the message broker may safely redeliver the message later. Thus, by atomically committing the message and the side effects of its processing, we can ensure that the message is effectively processed exactly once, even if it requires a few retries before it succeeds. The abort discards any side effects of the partially completed transaction. This is known as **exactly-once semantics**.
-
 #### XA Transactions
 
-X/Open XA (short for eXtended Architecture) is a standard for implementing 2PC across heterogeneous technologies [75]. It was introduced in 1991 and has been widely implemented. XA is supported by many traditional relational databases (including PostgreSQL, MySQL, Db2, SQL Server, and Oracle) and message brokers (including ActiveMQ, HornetQ, MSMQ, and IBM MQ).
+X/Open XA (short for eXtended Architecture) is a standard for implementing 2PC across heterogeneous technologies [X/Open, 1991]. It was introduced in 1991 and has been widely implemented. XA is supported by many traditional relational databases (including PostgreSQL, MySQL, Db2, SQL Server, and Oracle) and message brokers (including ActiveMQ, HornetQ, MSMQ, and IBM MQ).
 
-XA is not a network protocol—it is merely a C API for interfacing with a transaction coordinator. Bindings for this API exist in other languages; for example, in the world of Java EE applications, XA transactions are implemented using the Java Transaction API (JTA).
+XA is not a network protocol — it is merely a C API for interfacing with a transaction coordinator. Bindings for this API exist in other languages; for example, in the world of Java EE applications, XA transactions are implemented using the Java Transaction API (JTA).
 
-#### Holding Locks While in Doubt
-
-Why do we care so much about a transaction being stuck in doubt? The problem is with locking. Database transactions usually acquire row-level exclusive locks on any rows they modify, to prevent dirty writes. If you want serializable isolation, a database using 2PL would also have to acquire shared locks on any rows read by the transaction.
-
-The database cannot release those locks until the transaction commits or aborts. Therefore, when using 2PC, a transaction must hold onto the locks throughout the time it is in doubt. If the coordinator has crashed and takes 20 minutes to start up again, those locks will be held for 20 minutes. If the coordinator's log is entirely lost for some reason, those locks will be held forever—or at least until the situation is manually resolved by an administrator.
-
-#### Recovering from Coordinator Failure
-
-In theory, if the coordinator crashes and is restarted, it should cleanly recover its state from the log and resolve any in-doubt transactions. However, in practice, orphaned in-doubt transactions do occur [85, 86]—that is, transactions for which the coordinator cannot decide the outcome for whatever reason.
-
-Many XA implementations have an emergency escape hatch called **heuristic decisions**: allowing a participant to unilaterally decide to abort or commit an in-doubt transaction without a definitive decision from the coordinator [75]. To be clear, heuristic here is a euphemism for probably breaking atomicity, since the heuristic decision violates the system of promises in 2PC.
-
-#### Problems with XA Transactions
+#### Limitations of XA
 
 A single-node coordinator is a single point of failure for the entire system, and making it part of the application server is also problematic because the coordinator's logs on its local disk become a crucial part of the durable system state.
 
 In principle, the coordinator of an XA transaction could be highly available and replicated, just as we would expect of any other important database. Unfortunately, this still doesn't solve a fundamental problem with XA, which is that it provides no way for the coordinator and the participants of a transaction to communicate with each other directly.
 
+A transaction that is in doubt (the coordinator crashed after participants voted yes but before they received the commit/abort decision) must hold its locks until the coordinator recovers. If the coordinator takes 20 minutes to restart, locks are held for 20 minutes; if the coordinator's log is entirely lost, the locks are held forever (or until an administrator manually resolves the situation). Many XA implementations provide an emergency escape hatch called **heuristic decisions**, which allow a participant to unilaterally commit or abort an in-doubt transaction without a definitive decision from the coordinator [X/Open, 1991] — a euphemism for probably breaking atomicity, since it violates 2PC's system of promises. Orphaned in-doubt transactions do occur in practice [85, 86].
+
 Another problem is that since XA needs to be compatible with a wide range of data systems, it is necessarily a lowest common denominator. For example, it cannot detect deadlocks across different systems, and it does not work with SSI.
 
 ### Database-Internal Distributed Transactions
 
-There is a big difference between distributed transactions that span multiple heterogeneous storage technologies and those that are internal to a system—that is, where all the participating nodes are part of the same database running the same software. Such internal distributed transactions are a defining feature of "NewSQL" databases such as CockroachDB [5], TiDB [6], Spanner [7], FoundationDB [8], and YugabyteDB.
+There is a big difference between distributed transactions that span multiple heterogeneous storage technologies and those that are internal to a system — that is, where all the participating nodes are part of the same database running the same software. Such internal distributed transactions are a defining feature of "NewSQL" databases such as CockroachDB [5], TiDB [6], Spanner [Corbett et al., 2013], FoundationDB [8], and YugabyteDB.
 
 Many of these systems use 2PC to ensure atomicity of transactions that write to multiple shards, yet they don't suffer from the same problems as XA transactions. The biggest problems with XA can be fixed by:
 
@@ -1664,7 +1605,11 @@ Many of these systems use 2PC to ensure atomicity of transactions that write to 
 
 Consensus algorithms are commonly used to replicate the coordinator and the database shards. We will see in Chapter 10 how atomic commitment for distributed transactions can be implemented using a consensus algorithm.
 
-### Exactly-Once Message Processing Revisited
+### Exactly-Once Message Processing
+
+Heterogeneous distributed transactions allow diverse systems to be integrated in powerful ways — for example, atomically committing a message acknowledgment and database writes in a single transaction so that the broker can safely redeliver on failure. The mechanism that achieves **exactly-once semantics** is detailed below.
+
+#### Exactly-Once Message Processing Revisited
 
 We saw that an important use case for distributed transactions is to ensure that an operation takes effect exactly once, even if a crash occurs while it is being processed and the processing needs to be retried. If you can atomically commit a transaction across a message broker and a database, you can acknowledge the message to the broker if and only if it was successfully processed and the database writes resulting from the process were committed.
 
@@ -1699,7 +1644,7 @@ sequenceDiagram
     end
 ```
 
-Thus, achieving exactly-once processing requires only transactions within the database—atomicity across database and message broker is not necessary for this use case. Recording the message ID in the database makes the message processing **idempotent**, so that message processing can be safely retried without duplicating its side effects. A similar approach is used in stream processing frameworks such as Kafka Streams to achieve exactly-once semantics, as we shall see in Chapter 12.
+Thus, achieving exactly-once processing requires only transactions within the database — atomicity across database and message broker is not necessary for this use case. Recording the message ID in the database makes the message processing **idempotent**, so that message processing can be safely retried without duplicating its side effects. A similar approach is used in stream processing frameworks such as Kafka Streams to achieve exactly-once semantics, as we shall see in Chapter 12.
 
 ```python
 # Idempotent message processing using only single-DB transactions
@@ -1768,13 +1713,9 @@ class MessageProcessor:
 
 ## Summary
 
-Transactions are an abstraction layer that allows an application to pretend that certain concurrency problems and certain kinds of hardware and software faults don't exist. A large class of errors is reduced to a simple transaction abort, and the application just needs to try again.
+Transactions are an abstraction layer that allows an application to pretend that certain concurrency problems and certain kinds of hardware and software faults don't exist. A large class of errors is reduced to a simple transaction abort, and the application just needs to try again. Not all applications need transactions; an application with very simple access patterns can probably manage without them. For more complex access patterns, transactions hugely reduce the number of potential error cases you need to think about.
 
-In this chapter we saw many examples of problems that transactions help prevent. Not all applications are susceptible to all those problems; an application with very simple access patterns, such as reading and writing only a single record, can probably manage without transactions. However, for more complex access patterns, transactions can hugely reduce the number of potential error cases you need to think about.
-
-Without transactions, various error scenarios (processes crashing, network interruptions, power outages, disk full, unexpected concurrency, etc.) mean that data can become inconsistent in various ways. For example, denormalized data can easily go out of sync with the source data. Without transactions, it becomes very difficult to reason about the effects that complex interacting accesses can have on the database.
-
-### Summary of Anomalies by Isolation Level
+### Anomalies Prevented by Each Isolation Level
 
 | Isolation level | Dirty reads | Read skew | Phantom reads | Lost updates | Write skew |
 |---|---|---|---|---|---|
@@ -1782,15 +1723,6 @@ Without transactions, various error scenarios (processes crashing, network inter
 | Read committed | ✓ Prevented | ✗ Possible | ✗ Possible | ✗ Possible | ✗ Possible |
 | Snapshot isolation | ✓ Prevented | ✓ Prevented | ✓ Prevented | ? Depends | ✗ Possible |
 | Serializable | ✓ Prevented | ✓ Prevented | ✓ Prevented | ✓ Prevented | ✓ Prevented |
-
-### Anomaly Glossary
-
-- **Dirty reads** — One client reads another client's writes before they have been committed. The read-committed isolation level and stronger levels prevent dirty reads.
-- **Dirty writes** — One client overwrites data that another client has written but not yet committed. Almost all transaction implementations prevent dirty writes.
-- **Read skew** — A client sees different parts of the database at different points in time. Some cases of read skew are also known as nonrepeatable reads. This issue is most commonly prevented with snapshot isolation, which allows a transaction to read from a consistent snapshot corresponding to one particular point in time.
-- **Phantom reads** — A transaction reads objects that match a search condition. Another client makes a write that affects the results of that search. Snapshot isolation prevents straightforward phantom reads, but phantoms in the context of write skew require special treatment, such as index-range locks.
-- **Lost updates** — Two clients concurrently perform a read-modify-write cycle. One overwrites the other's write without incorporating its changes, so data is lost. Some implementations of snapshot isolation prevent this anomaly automatically, while others require a manual lock.
-- **Write skew** — A transaction reads something, makes a decision based on the value it saw, and writes the decision to the database. However, by the time the write is made, the premise of the decision is no longer true. Only serializable isolation prevents this anomaly.
 
 ### Three Approaches to Serializable Transactions
 
@@ -1816,7 +1748,7 @@ graph TB
 - **Two-phase locking** — For decades 2PL has been the standard way of implementing serializability, but many applications avoid using it because of its poor performance.
 - **Serializable snapshot isolation** — SSI is a comparatively new algorithm that avoids most of the downsides of the previous approaches. It uses an optimistic approach, allowing transactions to proceed without blocking. When a transaction wants to commit, it is checked, and it is aborted if the execution was not serializable.
 
-### Distributed Transactions at a Glance
+### Distributed Transactions in One Glance
 
 ```mermaid
 graph TB
@@ -1846,9 +1778,9 @@ graph TB
     style TPC fill:#FFA500
 ```
 
-Finally, we examined how to achieve atomicity when a transaction is distributed across multiple nodes, using 2PC. If those nodes are all running the same database software, distributed transactions can work quite well. However, across different storage technologies (using XA transactions), 2PC is problematic; it is very sensitive to faults in the coordinator and the application code driving the transaction, and it interacts poorly with concurrency control mechanisms.
+We examined how to achieve atomicity when a transaction is distributed across multiple nodes, using 2PC. If those nodes are all running the same database software, distributed transactions can work quite well. However, across different storage technologies (using XA transactions), 2PC is problematic; it is very sensitive to faults in the coordinator and the application code driving the transaction, and it interacts poorly with concurrency control mechanisms. Fortunately, idempotence can ensure exactly-once semantics without requiring atomic commit across different storage technologies.
 
-Fortunately, idempotence can ensure exactly-once semantics without requiring atomic commit across different storage technologies.
+### Choosing the Right Tool
 
 ```mermaid
 graph LR
@@ -1879,9 +1811,62 @@ The examples in this chapter used a relational data model. However, transactions
 
 ### Key Takeaways
 
-- **ACID** provides a vocabulary, but each database implements it differently—treat "ACID" as a starting point, not a contract.
+- **ACID** provides a vocabulary, but each database implements it differently — treat "ACID" as a starting point, not a contract.
 - **Atomicity** lets you abort safely; pair it with retries that handle transient errors and avoid duplicates.
 - **Isolation levels** have inconsistent names across databases. Always characterize them by the anomalies they prevent, not by the SQL standard label.
 - **Snapshot isolation** prevents most read anomalies but **not** lost updates, write skew, or phantoms in write-write scenarios.
 - **Serializable** is the only level that protects against all race conditions; modern implementations (SSI) make it affordable.
 - **Distributed transactions** across heterogeneous systems are expensive and risky; prefer **idempotence** for exactly-once message processing.
+
+---
+
+## References
+
+Numbered citations in this chapter correspond to entries in the source book's References list (e.g., Kleppmann, *Designing Data-Intensive Applications*, 2nd ed.). Author-year citations are resolved inline below.
+
+1. Post Office Horizon scandal analysis (ACID absence).
+2. Chamberlin et al., "A History and Evaluation of System R" (IBM, 1981).
+3. Gray, "Notes on Database Operating Systems" (IBM, 1978) — origin of System R isolation levels and 2PC.
+4. Eswaran et al., "The Notions of Consistency and Predicate Locks in a Database System" (CACM, 1976) — phantom read, predicate locks.
+5. Taft et al., "CockroachDB: The Resilient Geo-Distributed SQL Database" (SIGMOD, 2020).
+6. TiDB architecture and design documentation (PingCAP).
+7. Corbett et al., "Spanner: Google's Globally-Distributed Database" (OSDI, 2012).
+8. FoundationDB documentation and architecture papers.
+9. Härder & Reuter, "Principles of Transaction-Oriented Database Recovery" (ACM Computing Surveys, 1983) — coined ACID.
+10. Adya et al., "Generalized Isolation Level Definitions" (ICDE, 2000).
+11. Brewer, "Towards Robust Distributed Systems" (PODC keynote, 2000) — popularized BASE.
+12. Materialized views / triggers (database textbooks).
+13. Gray, "Notes on Database Operating Systems" (IBM, 1978).
+14. Berenson et al., "A Critique of ANSI SQL Isolation Levels" (SIGMOD, 1995).
+15. Zheng et al., "Understanding Latency Failures in SSD Devices" — fsync unreliability on SSDs.
+16, 17, 18. Disk firmware bug reports.
+19, 20, 21. PostgreSQL fsync bug discussion (2020 community thread).
+22, 23. Storage engine / filesystem corruption case studies.
+24. Filesystem corruption propagation across replicas.
+25, 26. Silent on-disk data corruption studies (e.g., Bairavasundaram et al.).
+27. Schroeder et al., "DRAM Errors in the Wild" (SIGMETRICS) and SSD failure studies.
+28. Intel / enterprise SSD data retention whitepapers.
+30. Adya et al. (isolation level comparison); Gray & Reuter (transaction processing).
+31, 32, 33, 34. Mt. Gox and related Bitcoin exchange race-condition analyses.
+35. Financial auditor investigations into transaction bugs.
+36. Customer-data corruption incident reports.
+38. Berenson et al., 1995 — dirty write, write skew.
+42, 43. PostgreSQL / MySQL InnoDB MVCC documentation.
+44, 45. PostgreSQL MVCC implementation details.
+46. Update-as-delete-plus-insert documentation (PostgreSQL).
+50. Lost-update solutions literature.
+54. Optimistic concurrency control / version columns.
+55, 67. Cahill et al., "Serializable Snapshot Isolation in PostgreSQL" (2008).
+56, 66. Ports & Grittner, "Serializable Snapshot Isolation in PostgreSQL" (VLDB, 2012); index-range locking (Graefe).
+59. Single-threaded loop feasibility (Stonebraker et al., H-Store).
+60, 61, 62. VoltDB, Redis, Datomic architecture papers.
+63. VoltDB cross-shard transaction throughput papers.
+68. Larson et al., "Hekaton: SQL Server's Memory-Optimized OLTP Engine" (SIGMOD, 2013).
+69. Neumann et al., "HyPer: A Hybrid OLTP&OLAP Main Memory Database" (VLDB, 2015).
+73, 74. Gray, 1978 — 2PC foundations.
+75. X/Open XA specification (1991).
+76, 77. WS-AtomicTransaction / WS-Coordination specifications.
+79. Skeen, "Nonblocking Commit Protocols" (SIGMOD, 1981) — 3PC.
+80, 81, 82, 83. Distributed transaction criticism (Gray, Helland, etc.).
+84. Cloud-provider statements on the absence of distributed transactions.
+85, 86. Orphan in-doubt transaction case studies.

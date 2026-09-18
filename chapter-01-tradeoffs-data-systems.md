@@ -8,6 +8,14 @@ Modern applications are assembled from standard building blocks: databases, cach
 
 > "No one approach is fundamentally better than others; everything has pros and cons." — Martin Kleppmann
 
+## TL;DR
+
+- **Operational (OLTP) and analytical (OLAP) systems have different access patterns** and typically warrant different storage engines; most organizations run both, often split by a warehouse or data lake.
+- **Systems of record hold canonical data; everything else is derived** and can be rebuilt from the source. Being explicit about which is which clarifies data flow.
+- **Cloud services trade operational control for elasticity** and metered billing. The right answer depends on workload variability, team skills, and regulatory constraints — there is no universal winner.
+- **Cloud native architecture disaggregates storage from compute** (e.g., object storage holds durable bytes; compute instances are near-stateless), enabling elasticity at the cost of network round-trips.
+- **Distributed systems buy scalability, fault tolerance, and geographic reach** at the cost of complexity, network failures, and hard debugging — reach for them only when you genuinely need them.
+
 ---
 
 ## 1. Terminology: Frontends and Backends
@@ -41,9 +49,9 @@ graph LR
     style Search fill:#FFD700
 ```
 
-The biggest infrastructure challenges usually lie in the backend, because the backend handles data on behalf of every user, while a frontend typically deals only with one user's local data. Local-first software [2] flips this assumption — see the discussion in Chapter 14 — but for most web and mobile apps today, the backend is where data gravity lives.
+The biggest infrastructure challenges usually lie in the backend, because the backend handles data on behalf of every user, while a frontend typically deals only with one user's local data. Local-first software flips this assumption — see the discussion in Chapter 14 — but for most web and mobile apps today, the backend is where data gravity lives.
 
-A backend's application code is often **stateless**: when a request finishes, the process forgets everything about it. Any state that needs to survive between requests is persisted on the client (browser localStorage, mobile SQLite) or in server-side data infrastructure. Stateless backends are easy to scale horizontally — you can spin up more copies behind a load balancer — but every cross-request fact must live in some data system.
+A backend's application code is often **stateless**: when a request finishes, the process forgets everything about it. Any state that needs to survive between requests is persisted on the client (browser local storage, mobile SQLite) or in server-side data infrastructure. Stateless backends are easy to scale horizontally — you can spin up more copies behind a load balancer — but every cross-request fact must live in some data system.
 
 ### 1.1 Code Example: A Minimal Stateless Backend Endpoint
 
@@ -153,7 +161,7 @@ graph TB
     subgraph "Analytical Side"
         ETL["ETL / Data Pipeline"]
         DW[("Snowflake / BigQuery<br/>Data Warehouse")]
-        DL[("Data Lake<br/>S3 + Parquet")]
+        DL[("Data Lake<br/>S + Parquet")]
         BA["Business Analyst<br/>(SQL, BI tools)"]
         DS["Data Scientist<br/>(Python, Pandas, Spark)"]
         BA --> DW
@@ -174,7 +182,7 @@ graph TB
     style DS fill:#ffeb3b
 ```
 
-As these systems have matured, two new specialized roles have emerged: **data engineers**, who integrate the operational and analytical sides and own the data infrastructure; and **analytics engineers**, who model and transform data so it is useful for analysts and data scientists [3, 4]. Many engineers specialize in one side or the other, but understanding both is essential — the rest of this book covers them in equal depth.
+As these systems have matured, two new specialized roles have emerged: **data engineers**, who integrate the operational and analytical sides and own the data infrastructure; and **analytics engineers**, who model and transform data so it is useful for analysts and data scientists. Many engineers specialize in one side or the other, but understanding both is essential — the rest of this book covers them in equal depth.
 
 ### 2.1 Characterizing Transaction Processing and Analytics
 
@@ -193,7 +201,7 @@ Analytical workloads look very different. A typical analytical query scans over 
 - How many more bananas than usual did we sell during our latest promotion?
 - Which brand of baby food is most often bought together with brand X diapers?
 
-These reports drive BI decisions, so the access pattern became known as **online analytical processing (OLAP)** [5]. The line between OLTP and OLAP is fuzzy, but typical characteristics are listed in Table 1-1.
+These reports drive BI decisions, so the access pattern became known as **online analytical processing (OLAP)**. The line between OLTP and OLAP is fuzzy, but typical characteristics are listed in Table 1-1.
 
 ### 2.2 Table 1-1: Comparing Operational and Analytical Systems
 
@@ -214,136 +222,21 @@ In operational systems, end users are generally not allowed to construct custom 
 
 Analytical databases take the opposite approach: they give analysts the freedom to write arbitrary SQL by hand or to generate queries automatically through BI and visualization tools such as Tableau, Looker, or Microsoft Power BI.
 
-A third category — **product analytics** or **real-time analytics** — is designed for analytical workloads embedded directly into user-facing products. Systems such as **Apache Pinot**, **Apache Druid**, and **ClickHouse** [6] ingest data in real time and optimize for low-latency query responses. They sit between classical OLAP (batch ingest, throughput-optimized) and OLTP (point queries, low latency on individual records) — handling "lots of small aggregation queries" rather than "few large ones."
+A third category — **product analytics** or **real-time analytics** — is designed for analytical workloads embedded directly into user-facing products. Systems such as **Apache Pinot**, **Apache Druid**, and **ClickHouse** ingest data in real time and optimize for low-latency query responses. They sit between classical OLAP (batch ingest, throughput-optimized) and OLTP (point queries, low latency on individual records) — handling "lots of small aggregation queries" rather than "few large ones."
 
-### 2.3 A Concrete OLTP vs OLAP Example
-
-To make the difference tangible, imagine the following illustrative scenario (numbers are typical for a large social network, not drawn from any specific company):
-
-- 500 million posts created per day.
-- 500,000,000 / 86,400 ≈ **5,800 posts/sec** average.
-- Peak rate during major events: **150,000 posts/sec**.
-
-```mermaid
-graph LR
-    subgraph "OLTP Workload"
-        A1["INSERT post (1 record)"] --> A2["Latency target: < 50 ms"]
-    end
-    subgraph "OLAP Workload"
-        B1["SELECT count, avg(length)<br/>FROM posts WHERE date = ..."] --> B2["Scans billions of rows"]
-    end
-    style A1 fill:#90EE90
-    style A2 fill:#90EE90
-    style B1 fill:#FFD700
-    style B2 fill:#FFD700
-```
-
-An OLTP query like `INSERT INTO posts (...) VALUES (...)` should complete in tens of milliseconds. An OLAP query like "average post length by hour for the last 30 days" scans billions of rows and may take minutes — but it answers a question no OLTP query could.
+> For a worked numerical example that contrasts an OLTP insert against an OLAP scan at the scale of a large social network, see Chapter 2, §"Operational vs Analytical at Scale".
 
 ---
 
 ## 3. Data Warehousing
 
-At first, the same databases were used for both transaction processing and analytical queries. SQL turned out to be quite flexible: it works well for both. But in the late 1980s and early 1990s, a trend emerged: companies stopped running analytics on their OLTP systems and moved that work to a separate database called a **data warehouse**.
+A data warehouse is a separate database for analytical queries, decoupled from the OLTP systems where data is created. This separation exists because analysts and data scientists must not query production OLTP systems directly — the schemas are wrong for analytics, joins across systems are painful, heavy queries would starve real-time traffic, and access-control boundaries often keep analysts off the production network entirely.
 
-A large enterprise may have dozens — even hundreds — of OLTP systems: customer-facing web properties, point-of-sale checkout systems, warehouse inventory, vehicle routing, supplier management, payroll, and more. Each system is complex, has its own team, and operates largely independently.
+- **Data warehouses** store cleaned, schema-enforced data, typically queried through SQL and BI tools.
+- **Data lakes** store raw data in object storage (Parquet, Avro, images, etc.) for data scientists and ML pipelines; the schema is applied at read time (see Chapter 3 §5).
+- **ETL/ELT pipelines** move data from operational systems into warehouses or lakes. Chapter 4 §8 covers storage layout and the trade-offs between schemas; Chapter 11 covers pipeline mechanics.
 
-It is undesirable for analysts and data scientists to query these OLTP systems directly, for several reasons:
-
-1. **Data silos**: The data of interest may be spread across multiple operational systems, making joins painful or impossible.
-2. **Schema mismatch**: Schemas and layouts that are good for OLTP are often poorly suited for analytics (see "Stars and Snowflakes: Schemas for Analytics" in Chapter 3).
-3. **Performance interference**: A heavy analytical query can starve the OLTP database's normal traffic.
-4. **Access control**: OLTP systems may live in networks that analysts aren't allowed to reach, for security or compliance reasons.
-
-A data warehouse solves all of these problems. It is a separate database analysts can query freely, without affecting OLTP operations [7]. As we will see in Chapter 4, data warehouses often store data very differently from OLTP databases to optimize for analytical access patterns.
-
-### 3.1 ETL: Extract, Transform, Load
-
-The data warehouse contains a read-only copy of data from all the various OLTP systems. Getting data into the warehouse is a multi-step pipeline known as **extract–transform–load (ETL)**:
-
-```mermaid
-graph LR
-    A["OLTP Systems<br/>(sources of truth)"] -->|"Extract<br/>(dump or CDC stream)"| B["Staging Area<br/>(raw, dirty)"]
-    B -->|"Transform<br/>(clean, dedupe, join)"| C["Cleaned Data<br/>(in warehouse schema)"]
-    C -->|"Load"| D[("Data Warehouse<br/>(Snowflake, BigQuery, Redshift)")]
-
-    A -->|"External SaaS<br/>APIs"| E["Fivetran / Airbyte<br/>(managed ETL)"]
-    E --> C
-
-    style A fill:#90EE90
-    style B fill:#FFA500
-    style C fill:#87CEEB
-    style D fill:#FFD700
-    style E fill:#DDA0DD
-```
-
-Sometimes the order of the last two steps is swapped — load first, transform inside the warehouse — yielding **ELT**. ELT has become popular because modern cloud data warehouses can run transforms in parallel at high speed, and because it preserves the raw data for later re-processing.
-
-When the data sources are external SaaS products (CRM, email marketing, payment processing), you typically don't have direct access to the original database; the vendor exposes an API. ETL for SaaS APIs is often implemented by specialist data connector services such as **Fivetran**, **Singer**, or **Airbyte**.
-
-### 3.2 HTAP: Hybrid Transactional/Analytical Processing
-
-Some database systems offer **hybrid transactional/analytical processing (HTAP)**, which aims to support OLTP and analytics in a single system without ETL between them [8, 9]. However, many HTAP systems internally consist of an OLTP system coupled with a separate analytical system, hidden behind a common interface — so the distinction between the two remains important for understanding how they work.
-
-HTAP does not replace data warehouses. It is useful when the same application needs to perform analytical queries that scan a large number of rows *and* read and update individual records with low latency. **Fraud detection** is a textbook example [10]: every new transaction triggers both a fast point read against customer history and a heavy aggregation scan over recent activity patterns.
-
-The separation between operational and analytical systems reflects a wider trend. As workloads have grown more demanding, systems have become more specialized and optimized for particular workloads. General-purpose systems handle small data volumes comfortably, but at greater scale, more specialized systems tend to win [11].
-
-### 3.3 From Data Warehouse to Data Lake
-
-A data warehouse often uses a relational data model queried through SQL, with BI software on top. This works well for analysts, but is less suited for data scientists doing things like:
-
-- **Feature engineering**: turning rows and columns of a database table into a vector or matrix of numerical values that an ML model can consume.
-- **NLP on text**: extracting sentiment, topics, or entities from product reviews.
-- **Computer vision**: extracting structured information from images.
-
-Although there have been efforts to add ML operators to SQL [12] and to build efficient ML systems on top of a relational foundation [13], many data scientists prefer not to work in a relational warehouse. Instead, they reach for **Pandas** and **scikit-learn**, statistical languages like **R**, and distributed analytics frameworks like **Spark** [14]. We discuss these tools further in Chapter 4 ("DataFrames, Matrices, and Arrays").
-
-The answer to "make data available in a form data scientists can use" is a **data lake**: a centralized data repository that holds a copy of any data that might be useful for analysis, obtained from operational systems via ETL pipelines. The difference from a data warehouse is that a data lake contains *files*, with no enforced file format, data model, or schema [15]. Files might be collections of database records encoded in **Avro** or **Parquet**, but a data lake can equally well contain text, images, video, sensor readings, sparse matrices, feature vectors, or genome sequences [16]. Data lakes are also usually cheaper than relational warehouses, because they use commoditized object storage (see "Cloud Native System Architecture" below).
-
-```mermaid
-graph TB
-    subgraph "Operational"
-        OLTP[("PostgreSQL<br/>System of Record")]
-    end
-
-    subgraph "Analytical - Structured"
-        DW[("Snowflake<br/>Data Warehouse<br/>(SQL + schema)")]
-    end
-
-    subgraph "Analytical - Raw"
-        DL["Data Lake<br/>(S3 + Parquet/Avro/JSON/images/...)"]
-    end
-
-    OLTP -->|"ETL (transform to schema)"| DW
-    OLTP -->|"ETL (raw, schema-on-read)"| DL
-    DL -->|"Optional: re-transform later"| DW
-
-    style OLTP fill:#90EE90
-    style DW fill:#FFD700
-    style DL fill:#87CEEB
-```
-
-ETL pipelines have been generalized to **data pipelines**, and the data lake often becomes an intermediate stop between operational systems and the data warehouse. The lake holds data in its raw form, and each consumer transforms it into the form that best suits them. This is sometimes called the **sushi principle**: "raw data is better" [17].
-
-### 3.4 Beyond the Data Lake
-
-As analytics practices have matured, organizations have paid increasing attention to the management and operations of analytical systems and data pipelines, captured, for example, in the **DataOps Manifesto** [18]. This has been driven partly by:
-
-- **Governance, privacy, and compliance** with regulations such as GDPR and CCPA (see "Data Systems, Law, and Society" below, and Chapter 14).
-- **The shift from files to event streams**: data for analytics is increasingly delivered as streams, not just file dumps. Stream processing allows analytical systems to respond to events in seconds rather than waiting for the next batch run. Fraud and abuse detection are typical beneficiaries.
-
-In some cases, the outputs of analytical systems are fed back into operational systems, a process sometimes known as **reverse ETL** [19]. For example, an ML model trained on warehouse data may be deployed to production to generate recommendations for end users. Tools such as **TFX**, **Kubeflow**, and **MLflow** specialize in this deployment path.
-
-```mermaid
-graph LR
-    A["Operational System"] -->|"forward ETL"| B["Warehouse / Lake"]
-    B -->|"Train ML model"| C["Model artifact"]
-    C -->|"reverse ETL"| A
-    style A fill:#90EE90
-    style B fill:#FFD700
-    style C fill:#DDA0DD
-```
+The separation between operational and analytical systems reflects a wider trend. As workloads have grown more demanding, systems have become more specialized and optimized for particular workloads. General-purpose systems handle small data volumes comfortably, but at greater scale, more specialized systems tend to win.
 
 ---
 
@@ -485,7 +378,7 @@ The pattern is uniform: **write to the system of record, propagate to derived sy
 With anything an organization needs to do, one of the first questions is whether it should be done in-house or outsourced: **build or buy?** Ultimately, this is a question about business priorities. A common rule of thumb:
 
 - Things that are a **core competency** or **competitive advantage** should be done in-house.
-- Things that are **non-core, routine, or commonplace** should be left to a vendor [20].
+- Things that are **non-core, routine, or commonplace** should be left to a vendor.
 
 For an extreme example, most companies do not fabricate their own CPUs — it is far cheaper to buy them from semiconductor manufacturers.
 
@@ -509,11 +402,11 @@ A related question is **how** you deploy services — for example, with Kubernet
 
 ### 5.1 Pros and Cons of Cloud Services
 
-Using a cloud service rather than running comparable software yourself essentially **outsources the operation** of that software to the cloud provider. Cloud vendors claim this saves you time and money and lets you move faster. Whether that is actually true depends on your skills and workload.
+Using a cloud service rather than running comparable software yourself **outsources the operation** of that software to the cloud provider. Cloud vendors claim this saves you time and money and lets you move faster. Whether that is actually true depends on your skills and workload.
 
 **Arguments for cloud services:**
 
-- If you already know how to deploy and operate the system you need, and your load is predictable, then buying your own machines is often cheaper [21, 22].
+- If you already know how to deploy and operate the system you need, and your load is predictable, then buying your own machines is often cheaper.
 - If you need a system you don't already know how to run, adopting a cloud service is often quicker than learning to operate it. Hiring and training staff to maintain a system is expensive.
 - Outsourcing operation to a specialist provider can yield better service: the provider gains operational expertise from serving many customers.
 - Cloud services are particularly valuable when **load varies a lot over time**. If you provision machines for peak load but they sit idle most of the time, your cost-effectiveness drops. Cloud services make it easier to scale resources up or down with demand.
@@ -532,12 +425,10 @@ Despite these risks, it has become more common for organizations to build new ap
 
 ### 5.2 Table 1-2: Self-Hosted vs Cloud Native Systems
 
-This is a representative (not exhaustive) comparison. Systems designed from the ground up for the cloud tend to have advantages in performance, recovery, scaling, and dataset size [24, 25, 26].
-
 | Category | Self-hosted systems | Cloud native systems |
 |---|---|---|
-| Operational/OLTP | MySQL, PostgreSQL, MongoDB | AWS Aurora [24], Azure SQL DB Hyperscale [25], Google Cloud Spanner |
-| Analytical/OLAP | Teradata, ClickHouse, Spark | Snowflake [26], Google BigQuery, Azure Synapse Analytics |
+| Operational/OLTP | MySQL, PostgreSQL, MongoDB | AWS Aurora, Azure SQL DB Hyperscale, Google Cloud Spanner |
+| Analytical/OLAP | Teradata, ClickHouse, Spark | Snowflake, Google BigQuery, Azure Synapse Analytics |
 
 ---
 
@@ -545,7 +436,7 @@ This is a representative (not exhaustive) comparison. Systems designed from the 
 
 Besides the economic shift (subscription vs capital expense), the rise of the cloud has had a **profound effect on how data systems are implemented** at a technical level. The term **cloud native** describes architectures designed to take advantage of cloud services.
 
-In principle, almost any self-hostable software can be provided as a cloud service, and managed services are now available for many popular data systems. However, systems designed from the ground up to be cloud native have shown several advantages [24, 25, 26]:
+In principle, almost any self-hostable software can be provided as a cloud service, and managed services are now available for many popular data systems. However, systems designed from the ground up to be cloud native have shown several advantages:
 
 - Better performance on the same hardware.
 - Faster recovery from failures.
@@ -561,7 +452,7 @@ In a cloud, this kind of software can run in an **IaaS** environment: one or mor
 The key idea of cloud native services is to **build on lower-level cloud services to create higher-level services**. Examples:
 
 - **Object storage** (Amazon S3, Azure Blob Storage, Cloudflare R2) stores large files. Its API is more limited than a typical filesystem (basic reads and writes), but it hides the underlying machines and automatically distributes data across them. Even if individual machines or disks fail entirely, no data is lost.
-- Many higher-level services are built on top of object storage. **Snowflake** is a cloud-based analytical database that relies on S3 for data storage [26]; other services, in turn, build on Snowflake.
+- Many higher-level services are built on top of object storage. **Snowflake** is a cloud-based analytical database that relies on S3 for data storage; other services, in turn, build on Snowflake.
 
 ```mermaid
 graph TB
@@ -588,12 +479,12 @@ In traditional computing, disk storage is treated as durable: once written, the 
 
 In the cloud, compute instances may have local disks, but cloud native systems typically treat these disks as an **ephemeral cache** rather than long-term storage. The local disk becomes inaccessible if the associated instance fails or is replaced (e.g., to scale up to a bigger instance type on a different physical machine).
 
-An alternative is **virtual disk storage**: cloud-managed block devices (Amazon EBS, Azure managed disks, Google persistent disks) that can be detached from one instance and attached to another. A virtual disk isn't a physical disk; it's a service provided by a separate set of machines that emulates a block device (typically 4 KiB blocks). This lets you run traditional disk-based software in the cloud, but the block-device emulation adds overhead that cloud-native designs avoid [24]. Every I/O operation on a virtual disk is also a network call, making the application very sensitive to network glitches [27].
+An alternative is **virtual disk storage**: cloud-managed block devices (Amazon EBS, Azure managed disks, Google persistent disks) that can be detached from one instance and attached to another. A virtual disk isn't a physical disk; it's a service provided by a separate set of machines that emulates a block device (typically 4 KiB blocks). This lets you run traditional disk-based software in the cloud, but the block-device emulation adds overhead that cloud-native designs avoid. Every I/O operation on a virtual disk is also a network call, making the application very sensitive to network glitches.
 
 Cloud native services avoid virtual disks and instead use **dedicated storage services** optimized for particular workloads:
 
 - Object storage (S3, Blob) is designed for long-term storage of large files (hundreds of KB to several GB).
-- Individual rows or values in a database are typically much smaller than that. Cloud databases manage small values in a separate service and store larger data blocks (containing many values) in an object store [25, 28]. Chapter 4 covers the details.
+- Individual rows or values in a database are typically much smaller than that. Cloud databases manage small values in a separate service and store larger data blocks (containing many values) in an object store. Chapter 4 covers the details.
 
 ```mermaid
 graph LR
@@ -618,15 +509,15 @@ graph LR
     style C_Compute fill:#FFB6C1
 ```
 
-In a traditional architecture, the same computer handles both storage and compute. In cloud native systems, these responsibilities have become **disaggregated** [9, 26, 29, 30]: S3 only stores files, and if you want to analyze that data, you must run analysis code somewhere else. This implies transferring data over the network — see "Distributed Versus Single-Node Systems" below.
+In a traditional architecture, the same computer handles both storage and compute. In cloud native systems, these responsibilities have become **disaggregated**: S3 only stores files, and if you want to analyze that data, you must run analysis code somewhere else. This implies transferring data over the network — see "Distributed Versus Single-Node Systems" below.
 
-Cloud native systems are also often **multitenant**: rather than dedicating a machine per customer, several customers share hardware within the same service [31]. Multitenancy enables better utilization, easier scalability, and easier management, but it requires careful engineering to ensure one customer's activity does not affect another's performance or security [32].
+Cloud native systems are also often **multitenant**: rather than dedicating a machine per customer, several customers share hardware within the same service. Multitenancy enables better utilization, easier scalability, and easier management, but it requires careful engineering to ensure one customer's activity does not affect another's performance or security.
 
 ---
 
 ## 7. Operations in the Cloud Era
 
-Traditionally, the people managing server-side data infrastructure were known as **database administrators (DBAs)** or **system administrators (sysadmins)**. More recently, many organizations have integrated development and operations into teams with shared responsibility for both backend services and data infrastructure; the **DevOps** philosophy has guided this trend. **Site reliability engineers (SREs)** are Google's implementation of this idea [33].
+Traditionally, the people managing server-side data infrastructure were known as **database administrators (DBAs)** or **system administrators (sysadmins)**. More recently, many organizations have integrated development and operations into teams with shared responsibility for both backend services and data infrastructure; the **DevOps** philosophy has guided this trend. **Site reliability engineers (SREs)** are Google's implementation of this idea.
 
 The role of operations is to ensure that services are reliably delivered to users — including configuring infrastructure, deploying applications, and maintaining a stable production environment through monitoring and diagnosis. For self-hosted systems, operations traditionally involved a lot of work at the level of individual machines:
 
@@ -647,9 +538,9 @@ Modern DevOps/SRE practices place greater emphasis on:
 - **Ephemeral infrastructure**: use short-lived VMs and services rather than long-running servers.
 - **Frequent updates**: enable rapid application deployment.
 - **Learning from incidents**: treat outages as learning opportunities.
-- **Preserving organizational knowledge**: even as individual people come and go [34].
+- **Preserving organizational knowledge**: even as individual people come and go.
 
-With the rise of cloud services, a **bifurcation of roles** has occurred. Operations teams at infrastructure companies specialize in providing reliable services to many customers; customers of those services spend as little time as possible on infrastructure [35].
+With the rise of cloud services, a **bifurcation of roles** has occurred. Operations teams at infrastructure companies specialize in providing reliable services to many customers; customers of those services spend as little time as possible on infrastructure.
 
 Cloud-service customers still need operations, but they focus on different aspects:
 
@@ -657,9 +548,9 @@ Cloud-service customers still need operations, but they focus on different aspec
 - Integrating services with each other.
 - Migrating from one service to another.
 
-Metered billing removes the need for capacity planning in the traditional sense, but it is still important to know what resources you are using and why — so that you don't waste money on resources you don't need. **Capacity planning becomes financial planning**, and **performance optimization becomes cost optimization** [36]. Cloud services also have resource limits and quotas (e.g., max concurrent processes) that you must plan for [37].
+Metered billing removes the need for capacity planning in the traditional sense, but it is still important to know what resources you are using and why — so that you don't waste money on resources you don't need. **Capacity planning becomes financial planning**, and **performance optimization becomes cost optimization**. Cloud services also have resource limits and quotas (e.g., max concurrent processes) that you must plan for.
 
-Adopting a cloud service is easier and quicker than provisioning your own infrastructure, though you still have to learn how to use the service and work around its limits. Integration among services is a particular challenge as a growing number of vendors offer ever more services targeting different use cases [38, 39]. ETL is only part of the story; operational cloud services also need to be integrated with each other. Standards for this kind of integration are still emerging, and significant manual effort is often required.
+Adopting a cloud service is easier and quicker than provisioning your own infrastructure, though you still have to learn how to use the service and work around its limits. Integration among services is a particular challenge as a growing number of vendors offer ever more services targeting different use cases. ETL is only part of the story; operational cloud services also need to be integrated with each other. Standards for this kind of integration are still emerging, and significant manual effort is often required.
 
 Other operational concerns that cannot be fully outsourced include:
 
@@ -783,8 +674,8 @@ Let's unpack each:
 5. **Latency**: if you have users around the world, you want servers in multiple regions so each user is served from a nearby one.
 6. **Elasticity**: if the workload is busy at some times and idle at others, a cloud deployment can scale up or down to match demand, so you pay only for what you actively use. On a single machine, you must provision for peak.
 7. **Specialized hardware**: different parts of the system can use different hardware — an object store on machines with many disks but few CPUs, a data analysis system on machines with lots of CPU and memory but no disks, an ML system on machines with GPUs.
-8. **Legal compliance**: some countries have data-residency laws requiring data about people in their jurisdiction to be stored and processed within that country [40]. A service with users in several such jurisdictions must distribute its data across multiple regions.
-9. **Sustainability**: with flexibility on where and when you run jobs, you can run them where and when renewable electricity is plentiful, reducing carbon emissions and taking advantage of cheap power [41, 42].
+8. **Legal compliance**: some countries have data-residency laws requiring data about people in their jurisdiction to be stored and processed within that country. A service with users in several such jurisdictions must distribute its data across multiple regions.
+9. **Sustainability**: with flexibility on where and when you run jobs, you can run them where and when renewable electricity is plentiful, reducing carbon emissions and taking advantage of cheap power.
 
 These reasons apply both to code you write yourself and to off-the-shelf software (databases, message queues, etc.).
 
@@ -792,7 +683,7 @@ These reasons apply both to code you write yourself and to off-the-shelf softwar
 
 Distributed systems also have downsides. Every request that traverses the network must handle the possibility of failure: the network may be interrupted, the service may be overloaded, or it may crash. Any request may time out without a response, and we don't know whether the service received it — a naive retry may not be safe. Chapter 9 explores these failure modes in detail.
 
-Datacenter networks are fast, but a network call to another service is still **vastly slower** than calling a function in the same process [43]. When operating on large volumes of data, transferring data from storage to a separate processing machine can be slower than bringing the computation to the data [44]. More nodes are not always faster: a simple single-threaded program on one computer can outperform a cluster with over 100 CPU cores [45].
+Datacenter networks are fast, but a network call to another service is still **vastly slower** than calling a function in the same process. When operating on large volumes of data, transferring data from storage to a separate processing machine can be slower than bringing the computation to the data. More nodes are not always faster: a simple single-threaded program on one computer can outperform a cluster with over 100 CPU cores.
 
 ```mermaid
 graph LR
@@ -801,11 +692,11 @@ graph LR
     style B fill:#ffcccc
 ```
 
-Troubleshooting a distributed system is often difficult. If the system is slow to respond, where is the problem? The discipline of **observability** [46, 47] addresses this by collecting data about a system's execution and exposing it for both high-level metrics and individual events. Tracing tools such as **OpenTelemetry**, **Zipkin**, and **Jaeger** let you track which client called which server for which operation and how long each call took [48].
+Troubleshooting a distributed system is often difficult. If the system is slow to respond, where is the problem? The discipline of **observability** addresses this by collecting data about a system's execution and exposing it for both high-level metrics and individual events. Tracing tools such as **OpenTelemetry**, **Zipkin**, and **Jaeger** let you track which client called which server for which operation and how long each call took.
 
-Databases provide various mechanisms for ensuring data consistency (Chapters 6 and 8), but when each service has its own database, maintaining consistency across services becomes the **application's** problem. Distributed transactions (Chapter 8) are a possible solution, but they are rarely used in microservices contexts because they run counter to the goal of service independence, and many databases don't support them [49].
+Databases provide various mechanisms for ensuring data consistency (Chapters 6 and 8), but when each service has its own database, maintaining consistency across services becomes the **application's** problem. Distributed transactions (Chapter 8) are a possible solution, but they are rarely used in microservices contexts because they run counter to the goal of service independence, and many databases don't support them.
 
-For all these reasons, performing a task on a single machine is often simpler and cheaper than setting up a distributed system [22, 45, 50]. CPUs, memory, and disks have grown larger, faster, and more reliable. Combined with single-node databases such as **DuckDB**, **SQLite**, and **KùzuDB**, many workloads can now run on a single node. We will explore this further in Chapter 4.
+For all these reasons, performing a task on a single machine is often simpler and cheaper than setting up a distributed system. CPUs, memory, and disks have grown larger, faster, and more reliable. Combined with single-node databases such as **DuckDB**, **SQLite**, and **KùzuDB**, many workloads can now run on a single node. We will explore this further in Chapter 4.
 
 ### 8.3 Code Example: Latency Numbers Every Engineer Should Know
 
@@ -813,8 +704,7 @@ For all these reasons, performing a task on a single machine is often simpler an
 """
 A toy model of the "latency numbers" that motivate moving
 computation to data (or accepting distributed systems only when
-forced to). Values are rough orders of magnitude drawn from
-publicly cited figures (cf. [43]).
+forced to). Values are rough orders of magnitude.
 """
 
 import time
@@ -861,7 +751,7 @@ The takeaway: every cross-machine hop is orders of magnitude more expensive than
 
 The most common way to distribute a system is the **client–server** model: clients make requests to servers over the network, usually via HTTP. The same process may act as both server (handling inbound requests) and client (making outbound calls).
 
-This style of building applications has traditionally been called a **service-oriented architecture (SOA)**; more recently it has been refined into a **microservices** architecture [51, 52]. In a microservices architecture:
+This style of building applications has traditionally been called a **service-oriented architecture (SOA)**; more recently it has been refined into a **microservices** architecture. In a microservices architecture:
 
 - Each service has one well-defined purpose (e.g., S3's purpose is file storage).
 - Each service exposes an API callable over the network.
@@ -908,13 +798,13 @@ But there are downsides:
 - **Each service needs its own infrastructure** for deployment, scaling, log collection, monitoring, and on-call alerting. Orchestration frameworks such as **Kubernetes** have become popular because they provide a foundation for this infrastructure.
 - **API evolution is hard**. Clients expect certain fields. Adding or removing fields can break clients, and failures are often discovered late in the deployment cycle. API description standards such as **OpenAPI** and **gRPC** help manage this; we discuss them further in Chapter 5.
 
-The deepest truth about microservices is that they are **primarily a technical solution to a people problem**: allowing different teams to make progress independently without coordinating. This is valuable in a large company. In a small company with fewer teams, microservices are usually unnecessary overhead, and the simplest implementation is preferable [51].
+The deepest truth about microservices is that they are **primarily a technical solution to a people problem**: allowing different teams to make progress independently without coordinating. This is valuable in a large company. In a small company with fewer teams, microservices are usually unnecessary overhead, and the simplest implementation is preferable.
 
 ### 9.2 Serverless and FaaS
 
-**Serverless** (or **function as a service, FaaS**) is another approach to deploying services, in which infrastructure management is outsourced to a cloud vendor [32].
+**Serverless** (or **function as a service, FaaS**) is another approach to deploying services, in which infrastructure management is outsourced to a cloud vendor.
 
-With VMs, you explicitly choose when to start or shut down an instance. With the serverless model, the cloud provider automatically allocates and frees hardware based on incoming requests [53]. Just as cloud storage replaced capacity planning with metered billing, serverless brings metered billing to code execution: you pay only for the time your application code is actually running.
+With VMs, you explicitly choose when to start or shut down an instance. With the serverless model, the cloud provider automatically allocates and frees hardware based on incoming requests. Just as cloud storage replaced capacity planning with metered billing, serverless brings metered billing to code execution: you pay only for the time your application code is actually running.
 
 ```mermaid
 graph LR
@@ -955,9 +845,9 @@ graph TB
 Key differences:
 
 - **Workloads**: Supercomputers typically run computationally intensive scientific tasks — weather forecasting, climate modeling, molecular dynamics, complex optimization, partial differential equations. Cloud computing tends to serve online services and business data systems that need high availability.
-- **Failure handling**: A supercomputer typically runs large batch jobs that **checkpoint** state to disk periodically. If a node fails, a common solution is to stop the entire cluster workload, repair the faulty node, and restart from the last checkpoint [54, 55]. With cloud services, stopping the entire cluster is undesirable because services must continually serve users.
-- **Interconnect**: Supercomputer nodes often communicate through **shared memory and RDMA**, which support high bandwidth and low latency but assume a high level of trust among users [56]. Cloud networks use IP and Ethernet, arranged in **Clos topologies** to provide high bisection bandwidth [54, 57]. They also require stronger isolation (VMs, encryption, authentication) because the network and machines are shared by mutually untrusting organizations.
-- **Topology**: Supercomputers often use specialized topologies (multidimensional meshes and toruses [58]) that yield better performance for HPC workloads with known communication patterns.
+- **Failure handling**: A supercomputer typically runs large batch jobs that **checkpoint** state to disk periodically. If a node fails, a common solution is to stop the entire cluster workload, repair the faulty node, and restart from the last checkpoint. With cloud services, stopping the entire cluster is undesirable because services must continually serve users.
+- **Interconnect**: Supercomputer nodes often communicate through **shared memory and RDMA**, which support high bandwidth and low latency but assume a high level of trust among users. Cloud networks use IP and Ethernet, arranged in **Clos topologies** to provide high bisection bandwidth. They also require stronger isolation (VMs, encryption, authentication) because the network and machines are shared by mutually untrusting organizations.
+- **Topology**: Supercomputers often use specialized topologies (multidimensional meshes and toruses) that yield better performance for HPC workloads with known communication patterns.
 - **Geography**: Cloud nodes can be distributed across regions; supercomputers assume all nodes are close.
 
 Large-scale analytical systems sometimes share characteristics with supercomputing, which is why knowing about these techniques is useful if you work in that area. However, this book is mostly concerned with services that need to be continually available.
@@ -970,38 +860,32 @@ Data-systems architecture is shaped not only by technical goals and business req
 
 One particular concern is systems that store data about people and their behavior. Since 2018, the GDPR has given European residents greater control and legal rights over their personal data; similar privacy regulations have been adopted in many other jurisdictions (including the CCPA in California). Regulations around AI, such as the EU AI Act, impose further restrictions on how personal data may be used.
 
-Even in areas not directly subject to regulation, there is increasing recognition of the effects computer systems have on people and society. Social media has changed how individuals consume news, which influences political opinions and may affect elections. Automated systems increasingly make decisions with profound consequences for individuals: who gets a loan or insurance, who gets invited to a job interview, who is suspected of a crime [59].
+Even in areas not directly subject to regulation, there is increasing recognition of the effects computer systems have on people and society. Social media has changed how individuals consume news, which influences political opinions and may affect elections. Automated systems increasingly make decisions with profound consequences for individuals: who gets a loan or insurance, who gets invited to a job interview, who is suspected of a crime.
 
 Everyone who works on such systems shares a responsibility for considering the ethical impact of their decisions and ensuring compliance with relevant laws. Not everyone needs to become an expert in law and ethics, but a basic awareness of legal and ethical principles is just as important as foundational knowledge in distributed systems.
 
 ### 11.1 How Law Is Reshaping System Design
 
-Legal considerations are influencing the very foundations of data-system design [60]. For example:
+Legal considerations are influencing the foundations of data-system design. The GDPR deliberately avoids mandating technologies (which would quickly become outdated), instead setting high-level principles subject to interpretation. There is no simple answer to "how do we comply?", but the regulation creates recurring engineering challenges:
 
-- The GDPR grants individuals the **right to erasure** (the "right to be forgotten"). But many data systems rely on **immutable constructs** such as append-only logs. How do you erase data in the middle of a file that is supposed to be immutable? How do you handle erasure of data that has been incorporated into derived datasets (see "Systems of Record and Derived Data" above), such as training data for ML models? These questions create new engineering challenges.
+| Engineering challenge | Technique |
+|---|---|
+| **Right to erasure** in append-only / log-structured storage | Tombstones, key rotation, encrypted blobs with deletable keys |
+| **Deletion of derived data** (caches, indexes, ML training data) | Track provenance; retrain models with corrected datasets; expire derived copies |
+| **Data residency** across multiple jurisdictions | Regional partitioning, geo-fenced storage services, per-region encryption keys |
+| **Consent and purpose limitation** | Capture consent at write time; enforce allowed-purpose tags at query time |
 
-We don't yet have clear guidelines on which particular technologies or architectures are GDPR-compliant. The regulation deliberately avoids mandating technologies, since these change quickly. Instead, it sets high-level principles subject to interpretation. There is no simple answer to "how do we comply?", but we will examine technologies through this lens in Chapter 14.
-
-```mermaid
-graph LR
-    A["GDPR<br/>(legal principle)"] --> B["Engineering challenge:<br/>deletion in immutable logs"]
-    A --> C["Engineering challenge:<br/>deletion in ML training data"]
-    A --> D["Engineering challenge:<br/>data residency across regions"]
-    style A fill:#FFD700
-    style B fill:#ffcccc
-    style C fill:#ffcccc
-    style D fill:#ffcccc
-```
+We will examine these techniques in detail in Chapter 14.
 
 ### 11.2 Data Minimization
 
 We store data because we think its value exceeds the cost of storage. But the cost of storage extends beyond the S3 bill. The cost-benefit calculation should also account for:
 
 - The risk of liability and reputational damage if data is leaked or compromised by adversaries.
-- The risk of legal costs and fines if data storage and processing are found non-compliant [50].
+- The risk of legal costs and fines if data storage and processing are found non-compliant.
 - The risk that governments or police forces compel companies to hand over data. When data could reveal criminalized behaviors (homosexuality in several Middle Eastern and African countries, seeking an abortion in several US states), storing it creates real safety risks. Travel to an abortion clinic can be revealed by location data or even a log of IP addresses.
 
-Once all risks are taken into account, it may be reasonable to conclude that **some data is simply not worth storing** and should therefore be deleted. This principle of **data minimization** (sometimes called **Datensparsamkeit** in German) runs counter to the "big data" philosophy of storing lots of data speculatively in case it turns out useful. Data minimization fits with the GDPR, which mandates that personal data may be collected only for a specified, explicit purpose; cannot later be used for any other purpose; and must not be kept longer than necessary [62].
+Once all risks are taken into account, it may be reasonable to conclude that **some data is simply not worth storing** and should therefore be deleted. This principle of **data minimization** (sometimes called **Datensparsamkeit** in German) runs counter to the "big data" philosophy of storing lots of data speculatively in case it turns out useful. Data minimization fits with the GDPR, which mandates that personal data may be collected only for a specified, explicit purpose; cannot later be used for any other purpose; and must not be kept longer than necessary.
 
 ### 11.3 Industry Compliance
 
@@ -1037,58 +921,7 @@ It is important to balance the needs of your business against the needs of the p
 
 The theme of this chapter has been to understand **trade-offs**: to recognize that many questions do not have one right answer, but several possibilities each with their own pros and cons. We explored some of the most important choices that affect the architecture of data systems, and we introduced terminology used throughout the rest of the book.
 
-```mermaid
-graph TB
-    Ch1["Chapter 1: Trade-Offs"]
-    Ch1 --> T1["OLTP vs OLAP"]
-    Ch1 --> T2["Cloud vs Self-Hosting"]
-    Ch1 --> T3["Distributed vs Single-Node"]
-    Ch1 --> T4["Law, Ethics, Society"]
-
-    T1 --> T1a["Data warehouse / data lake"]
-    T1 --> T1b["Systems of record / derived data"]
-    T2 --> T2a["Cloud native architecture"]
-    T2 --> T2b["Separation of storage/compute"]
-    T2 --> T2c["DevOps / SRE in cloud era"]
-    T3 --> T3a["Microservices / serverless"]
-    T3 --> T3b["Cloud vs supercomputing"]
-    T4 --> T4a["GDPR / data minimization"]
-
-    style Ch1 fill:#FFD700
-    style T1 fill:#90EE90
-    style T2 fill:#87CEEB
-    style T3 fill:#FFB6C1
-    style T4 fill:#DDA0DD
-```
-
-### 12.1 Key Takeaways
-
-1. **OLTP vs OLAP**: Operational systems handle many small interactive reads and writes; analytical systems handle fewer, larger queries that aggregate across many records. Different access patterns justify different storage engines and often different databases.
-2. **Data warehouses and data lakes**: Warehouses give analysts a SQL-friendly view of normalized data; lakes preserve raw data for diverse consumers (data scientists, ML pipelines, ad-hoc exploration).
-3. **Systems of record vs derived data**: The system of record holds the canonical data; everything else is derived and can be reconstructed. This distinction clarifies data flow and helps you reason about consistency.
-4. **Cloud vs self-hosting**: Cloud services trade operational control for elasticity and reduced operational toil. The right answer depends on workload variability, team skills, regulatory constraints, and strategic priorities.
-5. **Cloud native architecture**: Storage and compute are disaggregated; object storage holds the durable bytes; compute instances are near-stateless; multitenancy is the norm.
-6. **Distributed vs single-node**: Distributed systems give you scalability, fault tolerance, and geographic reach — at the cost of complexity, network failures, and hard debugging. Reach for them only when you genuinely need them.
-7. **Microservices and serverless**: Both are technical answers to people and operational problems. Useful at scale, overkill for small teams.
-8. **Law and ethics**: Data systems affect real people. GDPR, CCPA, the EU AI Act, and similar frameworks make legal compliance an architectural concern, not just a policy afterthought.
-
-### 12.2 What Comes Next
-
-- **Chapter 2** (Defining Nonfunctional Requirements) formalizes the metrics by which we judge data systems: reliability, scalability, maintainability, performance.
-- **Chapter 3** (the first of the "data" chapters) goes deep on relational data models, schemas, and transactions.
-- **Chapter 4** examines storage and retrieval in detail, including how OLTP and OLAP databases organize data on disk.
-- **Chapter 9** returns to distributed systems with the rigorous treatment of failure modes and consensus.
-- **Chapter 14** revisits ethics and legal compliance in depth.
-
-Throughout the rest of the book, we will keep returning to the theme of this chapter: every data-systems decision involves trade-offs, and choosing wisely requires understanding both the technology and the human context in which it operates.
-
 A useful frame: every architecture diagram is a hypothesis about which trade-offs matter most for your workload. As workloads change, the right architecture changes too. The discipline is in noticing when your hypothesis no longer holds and revising accordingly — not in defending the architecture you chose last quarter.
-
-The rest of the book gives you the technical vocabulary to make those revisions: how to measure reliability, how to reason about consistency, how to choose storage and replication strategies, and how to assemble streaming and batch pipelines. But none of that technical machinery substitutes for the simple, ongoing question: *given what we know today, is this still the right shape for this system?*
-
----
-
-### 12.3 A Mental Checklist for Chapter 1
 
 Use this checklist when starting any new data-systems project:
 
@@ -1103,97 +936,32 @@ Use this checklist when starting any new data-systems project:
 9. **Who owns the schema?** If nobody does, schema drift will eventually break the analytics. Pick a steward.
 10. **What is your blast radius if a region goes down?** Active-active multi-region is expensive; a tested failover runbook is often enough.
 
-We will return to each of these questions in subsequent chapters, with concrete techniques for answering them. The order in which you discover the answers matters less than the discipline of asking the questions regularly. A good architecture is one that survives contact with the next quarter's reality; trade-off literacy is what gets you there.
+**What comes next:**
 
-If you are reading this book linearly, you may find it helpful to skim this checklist once now, return to it after each subsequent chapter, and ask yourself which items have become more concrete (and which have become more complicated) as your understanding of the technical material deepened. If an item has become *less* clear, that is usually a sign the chapter introduced nuance you had not previously considered — and that is exactly the kind of progress this book is designed to enable.
+- **Chapter 2** formalizes the metrics by which we judge data systems: reliability, scalability, maintainability, performance.
+- **Chapter 3** is the first of the "data" chapters and goes deep on relational data models, schemas, and transactions.
+- **Chapter 4** examines storage and retrieval in detail, including how OLTP and OLAP databases organize data on disk.
+- **Chapter 9** returns to distributed systems with a rigorous treatment of failure modes and consensus.
+- **Chapter 14** revisits ethics and legal compliance in depth.
 
----
+The rest of the book gives you the technical vocabulary to make architecture revisions: how to measure reliability, how to reason about consistency, how to choose storage and replication strategies, and how to assemble streaming and batch pipelines. None of that technical machinery substitutes for the simple, ongoing question: *given what we know today, is this still the right shape for this system?*
 
-### 12.4 Further Reading by Topic
+### Further Reading
 
-If you want to dig deeper into specific topics introduced in this chapter, the following threads are good starting points (full citations in the References section below):
+If you want to dig deeper into specific topics introduced in this chapter:
 
-- **OLTP vs OLAP**: Codd's original OLAP paper [5]; Stonebraker and Çetintemel's "One Size Fits All" [11] for the argument that specialized systems win at scale.
-- **Data warehousing and lakes**: Chaudhuri and Dayal [7]; Hai et al. [15]; Fowler's "Data Lake" essay [16].
-- **HTAP**: Özcan et al. [8]; Prout et al. on SingleStore [9]; Zhang et al.'s 2024 survey [10].
-- **Cloud economics**: Hansson on leaving the cloud [21]; Badizadegan's "Use One Big Server" [22]; Cherkasky on (over-)paying for your datastore [36].
-- **Cloud native architecture**: Verbitski et al. on Aurora [24]; Antonopoulos et al. on Socrates/SQL Server Hyperscale [25]; Vuppalapati et al. on Snowflake's disaggregated storage [26].
-- **Distributed systems costs**: McSherry et al.'s "Scalability! But at What COST?" [45] is a classic.
-- **Microservices**: Newman's *Building Microservices* [51] and Richardson's InfoQ piece [52].
-- **Serverless**: Jonas et al.'s Berkeley view [32]; Hellerstein et al.'s "Serverless Computing: One Step Forward, Two Steps Back" [44].
-- **Ethics, GDPR, data minimization**: O'Neil's *Weapons of Math Destruction* [59]; Shastri et al. on GDPR's impact on database systems [60]; Fowler on Datensparsamkeit [61].
-
-Many of these references are blog posts and conference papers rather than textbooks; the field evolves faster than any book can capture, and primary sources are often the most reliable way to stay current.
-
----
-
-## References (selected, from chapter)
-
-1. Kouzes, R. T., et al. "The Changing Paradigm of Data-Intensive Computing." *IEEE Computer*, 42(1), Jan 2009.
-2. Kleppmann, M., et al. "Local-First Software: You Own Your Data, in Spite of the Cloud." *Onward!*, 2019.
-3. Reis, J. & Housley, M. *Fundamentals of Data Engineering*. O'Reilly, 2022.
-4. Machado, R. P. & Russa, H. *Analytics Engineering with SQL and dbt*. O'Reilly, 2023.
-5. Codd, E. F., et al. "Providing OLAP to User-Analysts: An IT Mandate." 1993.
-6. Soman, C. & Pawar, N. "Comparing Three Real-Time OLAP Databases." startree.ai, 2023.
-7. Chaudhuri, S. & Dayal, U. "An Overview of Data Warehousing and OLAP Technology." *ACM SIGMOD Record*, 1997.
-8. Özcan, F., Tian, Y., Tözün, P. "Hybrid Transactional/Analytical Processing: A Survey." *SIGMOD*, 2017.
-9. Prout, A., et al. "Cloud-Native Transactions and Analytics in SingleStore." *SIGMOD*, 2022.
-10. Zhang, C., et al. "HTAP Databases: A Survey." *IEEE TKDE*, 2024.
-11. Stonebraker, M. & Çetintemel, U. "'One Size Fits All': An Idea Whose Time Has Come and Gone." *ICDE*, 2005.
-12. Cohen, J., et al. "MAD Skills: New Analysis Practices for Big Data." *PVLDB*, 2009.
-13. Olteanu, D. "The Relational Data Borg Is Learning." *PVLDB*, 2020.
-14. Bornstein, M., Casado, M., Li, J. "Emerging Architectures for Modern Data Infrastructure." future.a16z.com, 2020.
-15. Hai, R., et al. "Data Lakes: A Survey of Functions and Systems." *IEEE TKDE*, 2023.
-16. Fowler, M. "Data Lake." martinfowler.com, 2015.
-17. Johnson, B. & Adler, J. "The Sushi Principle: Raw Data Is Better." Strata+Hadoop World, 2015.
-18. DataKitchen, Inc. "The DataOps Manifesto." dataopsmanifesto.org, 2017.
-19. Manohar, T. "What Is Reverse ETL." hightouch.io, 2021.
-20. Fournier, C. "Why Is It So Hard to Decide to Buy?" skamille.medium.com, 2021.
-21. Hansson, D. H. "Why We're Leaving the Cloud." world.hey.com, 2022.
-22. Badizadegan, N. "Use One Big Server." specbranch.com, 2022.
-23. Yegge, S. "Dear Google Cloud: Your Deprecation Policy Is Killing You." 2020.
-24. Verbitski, A., et al. "Amazon Aurora: Design Considerations." *SIGMOD*, 2017.
-25. Antonopoulos, P., et al. "Socrates: The New SQL Server in the Cloud." *SIGMOD*, 2019.
-26. Vuppalapati, M., et al. "Building an Elastic Query Engine on Disaggregated Storage." *NSDI*, 2020.
-27. Van Wiggeren, N. "The Real Failure Rate of EBS." planetscale.com, 2025.
-28. Breck, C. "Predicting the Future of Distributed Systems." blog.colinbreck.com, 2024.
-29. Shapira, G. "Compute-Storage Separation Explained." thenile.dev, 2023.
-30. Murthy, R. & Goindi, G. "AlloyDB for PostgreSQL Under the Hood." cloud.google.com, 2022.
-31. Vanlightly, J. "The Architecture of Serverless Data Systems." 2023.
-32. Jonas, E., et al. "Cloud Programming Simplified: A Berkeley View on Serverless Computing." arXiv:1902.03383, 2019.
-33. Beyer, B., et al. *Site Reliability Engineering*. O'Reilly, 2016.
-34. Limoncelli, T. "The Time I Stole $10,000 from Bell Labs." *ACM Queue*, 2020.
-35. Majors, C. "The Future of Ops Jobs." acloudguru.com, 2020.
-36. Cherkasky, B. "(Over)Pay as You Go for Your Datastore." medium.com, 2021.
-37. Kushchi, S. "Serverless Doesn't Mean DevOpsLess or NoOps." thenewstack.io, 2023.
-38. Bernhardsson, E. "Storm in the Stratosphere." erikbern.com, 2021.
-39. Stancil, B. "The Data OS." benn.substack.com, 2021.
-40. Korolov, M. "Data Residency Laws Pushing Companies Toward Residency as a Service." csoonline.com, 2022.
-41. Borenstein, S. "Can Data Centers Flex Their Power Demand?" 2025.
-42. Acun, B., et al. "Carbon Dependencies in Datacenter Design and Management." *ACM SIGENERGY*, 2023.
-43. Nath, K. "These Are the Numbers Every Computer Engineer Should Know." freecodecamp.org, 2019.
-44. Hellerstein, J. M., et al. "Serverless Computing: One Step Forward, Two Steps Back." arXiv:1812.03651, 2018.
-45. McSherry, F., Isard, M., Murray, D. G. "Scalability! But at What COST?" *HotOS*, 2015.
-46. Sridharan, C. *Distributed Systems Observability*. O'Reilly, 2018.
-47. Majors, C. "Observability—A 3-Year Retrospective." thenewstack.io, 2019.
-48. Sigelman, B. H., et al. "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure." Google, 2010.
-49. Laigner, R., et al. "Data Management in Microservices." *PVLDB*, 2021.
-50. Tigani, J. "Big Data Is Dead." motherduck.com, 2023.
-51. Newman, S. *Building Microservices*, 2nd ed. O'Reilly, 2021.
-52. Richardson, C. "Microservices: Decomposing Applications for Deployability and Scalability." infoq.com, 2014.
-53. Shahrad, M., et al. "Serverless in the Wild." *USENIX ATC*, 2020.
-54. Barroso, L. A., Hölzle, U., Ranganathan, P. *The Datacenter as a Computer*, 3rd ed. Springer, 2019.
-55. Fiala, D., et al. "Detection and Correction of Silent Data Corruption for Large-Scale HPC." *SC*, 2012.
-56. Simpson, A. K., et al. "Securing RDMA for High-Performance Datacenter Storage Systems." *HotCloud*, 2020.
-57. Singh, A., et al. "Jupiter Rising: A Decade of Clos Topologies." *SIGCOMM*, 2015.
-58. Lockwood, G. K. "Hadoop's Uncomfortable Fit in HPC." 2014.
-59. O'Neil, C. *Weapons of Math Destruction*. Crown, 2016.
-60. Shastri, S., et al. "Understanding and Benchmarking the Impact of GDPR on Database Systems." *PVLDB*, 2020.
-61. Fowler, M. "Datensparsamkeit." martinfowler.com, 2013.
-62. "Regulation (EU) 2016/679 (GDPR)." *Official Journal of the European Union*, 2016.
+- **OLTP vs OLAP**: Codd's original OLAP paper (1993); Stonebraker and Çetintemel's "One Size Fits All" (ICDE 2005) for the argument that specialized systems win at scale.
+- **Data warehousing and lakes**: Chaudhuri and Dayal, "An Overview of Data Warehousing and OLAP Technology" (ACM SIGMOD Record 1997); Hai et al., "Data Lakes: A Survey of Functions and Systems" (IEEE TKDE 2023); Fowler's "Data Lake" essay (martinfowler.com, 2015).
+- **HTAP**: Özcan, Tian, and Tözün, "Hybrid Transactional/Analytical Processing: A Survey" (SIGMOD 2017); Prout et al. on SingleStore (SIGMOD 2022); Zhang et al.'s 2024 survey in IEEE TKDE.
+- **Cloud economics**: Hansson, "Why We're Leaving the Cloud" (2022); Badizadegan, "Use One Big Server" (2022); Cherkasky, "(Over-)Pay as You Go for Your Datastore" (2021).
+- **Cloud native architecture**: Verbitski et al. on Aurora (SIGMOD 2017); Antonopoulos et al. on Socrates/SQL Server Hyperscale (SIGMOD 2019); Vuppalapati et al. on Snowflake's disaggregated storage (NSDI 2020).
+- **Distributed systems costs**: McSherry, Isard, and Murray, "Scalability! But at What COST?" (HotOS 2015) is a classic.
+- **Microservices**: Newman, *Building Microservices* (O'Reilly, 2nd ed. 2021); Richardson's InfoQ piece on microservices (2014).
+- **Serverless**: Jonas et al., "Cloud Programming Simplified: A Berkeley View on Serverless Computing" (arXiv:1902.03383, 2019); Hellerstein et al., "Serverless Computing: One Step Forward, Two Steps Back" (arXiv:1812.03651, 2018).
+- **Ethics, GDPR, data minimization**: O'Neil, *Weapons of Math Destruction* (Crown, 2016); Shastri et al., "Understanding and Benchmarking the Impact of GDPR on Database Systems" (PVLDB 2020); Fowler, "Datensparsamkeit" (martinfowler.com, 2013).
 
 ---
 
 ## Notes on This Synthesis
 
-This chapter note is a structured synthesis of the published 2nd-edition Chapter 1, intended for readers who want a navigable, diagram-rich companion while working through the printed text. Diagrams and code examples were created specifically for this synthesis and are not part of the original book. Specific product names (Snowflake, BigQuery, Aurora, ClickHouse, DuckDB, SQLite, KùzuDB, etc.) are mentioned as in the original text to illustrate the points being made; inclusion here does not imply endorsement. The example traffic numbers (500M posts/day, 5,800 posts/sec average, 150,000 posts/sec peak) are presented as a representative illustration of a large social-network workload, not as figures drawn from any specific company's published benchmarks. Readers are encouraged to verify any specific performance claim against the primary sources cited in the References section above before relying on it for production decisions.
+This chapter note is a structured synthesis of the published 2nd-edition Chapter 1, intended for readers who want a navigable, diagram-rich companion while working through the printed text. Diagrams and code examples were created specifically for this synthesis and are not part of the original book. Specific product names (Snowflake, BigQuery, Aurora, ClickHouse, DuckDB, SQLite, KùzuDB, etc.) are mentioned as in the original text to illustrate the points being made; inclusion here does not imply endorsement. Readers are encouraged to verify any specific performance claim against the primary sources cited in the Further Reading section above before relying on it for production decisions.

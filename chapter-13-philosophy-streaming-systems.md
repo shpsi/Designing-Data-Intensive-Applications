@@ -1,5 +1,13 @@
 # Chapter 13: A Philosophy of Streaming Systems
 
+## TL;DR
+
+- Treat data as a flow: route all writes through a system of record and derive every other representation (search index, cache, warehouse, ML store) from a CDC event log.
+- The event log is the substrate for derived data, the channel for cross-system consistency, and the audit trail for verifiability.
+- Compose specialized tools via the log rather than distributed transactions; use idempotent consumers, request IDs, and sharding by conflict key for correctness.
+- Trade-offs: derived data is eventually consistent. Integrity (no corruption) matters more than timeliness (no staleness) and should be enforced end-to-end.
+- Audit continuously with hash-chained logs and periodic reprocessing; no single layer guarantees correctness on its own.
+
 ## Introduction
 
 Over the previous chapters we explored the building blocks of data systems: storage engines, replication protocols, transaction models, consistency guarantees, and the tools for batch and stream processing. Each is a deep technical field in its own right. The remaining question is philosophical: how should we compose these pieces to build applications that are correct, evolvable, and durable?
@@ -28,7 +36,7 @@ graph TB
     OLTP -.->|"CDC"| WAREHOUSE
     OLTP -.->|"CDC"| STREAM
     STREAM --> ML
-    STREAM -.->|"derived state"| CACHE
+    STREAM -.->|"derived data"| CACHE
 
     style APP fill:#ffeb3b
     style OLTP fill:#90EE90
@@ -39,7 +47,7 @@ graph TB
     style ML fill:#FFA500
 ```
 
-The philosophy of streaming systems, as it has emerged over the last decade, is to treat data as a **flow** that moves through transformations, rather than as a static thing that lives in one place and gets queried. This philosophy touches every layer: how we integrate tools, how we maintain derived views, how we enforce correctness, and how we audit the system for silent corruption.
+The philosophy of streaming systems, as it has emerged over the last decade, is to treat data as a **flow** that moves through transformations, rather than as a static thing that lives in one place and gets queried. This philosophy touches every layer: how we integrate tools, how we maintain derived data, how we enforce correctness, and how we audit the system for silent corruption.
 
 This chapter is the philosophy chapter. It does not introduce new algorithms. Instead it ties together the ideas from the rest of the book into a coherent design approach, anchored on three pillars:
 
@@ -104,7 +112,7 @@ graph LR
     style APP fill:#ffeb3b
 ```
 
-The win is that all derived systems see writes in the same order, and the application only has to get one write right. The CDC log acts as the **single arbiter of ordering**, so derived views can never disagree on what the order of events was.
+The win is that all derived systems see writes in the same order, and the application only has to get one write right. The CDC log acts as the **single arbiter of ordering**, so derived data can never disagree on what the order of events was. (For the mechanics of how CDC events are extracted from a database, see Chapter 12; this chapter is concerned with the philosophy of using CDC as the wiring for data integration.)
 
 **Example: Twitter's search system.** Twitter maintains an in-house search system (Earlybird) that is derived from the primary tweet database via a CDC-style pipeline. The application never writes to the search index directly; instead, every new tweet and edit flows through the database, is captured by the log, and is then applied to Earlybird. If the search index diverges from the database for any reason (bug, partial outage), it can be rebuilt by replaying the log.
 
@@ -142,7 +150,7 @@ For this to work, two properties must hold:
 1. **Single point of entry.** All writes go through the system of record.
 2. **Deterministic derivation.** Each derived system reads the CDC log in order, applies its transformation, and writes its output. The transformation must be deterministic for the system to be replayable.
 
-This is essentially the **state machine replication** model from Chapter 10, applied at the level of an entire organization: a single total order of writes is replicated into many stateful systems that all deterministically process them.
+This is the **state machine replication** model from Chapter 10, applied at the level of an entire organization: a single total order of writes is replicated into many stateful systems that all deterministically process them.
 
 When a CDC log is the only input to a derived system, the derived state is a pure function of the log. That means:
 
@@ -152,118 +160,34 @@ When a CDC log is the only input to a derived system, the derived state is a pur
 
 This is why the **immutable, append-only event log** is so central. It is the substrate on which derived data lives.
 
+A minimal sketch of a derived consumer over a CDC log:
+
 ```python
-import json
-import time
-from typing import Callable, Iterable, Dict, Any
-from dataclasses import dataclass, field
-
-# A minimal model of a CDC event log and a derived consumer.
-# Every change to the source DB appears as an immutable event in the log.
-
 @dataclass(frozen=True)
 class ChangeEvent:
-    """An immutable event in the CDC log.
-
-    Each event represents one write to the source of record.
-    Events are append-only and ordered by offset.
-    """
-    offset: int            # monotonically increasing log offset
-    key: str               # primary key of the row that changed
-    op: str                # "insert" | "update" | "delete"
-    before: Dict[str, Any] # state before the change (for update/delete)
-    after: Dict[str, Any]  # state after the change (for insert/update)
-    timestamp: float = field(default_factory=time.time)
-
-    def to_dict(self) -> dict:
-        return {
-            "offset": self.offset,
-            "key": self.key,
-            "op": self.op,
-            "before": self.before,
-            "after": self.after,
-            "ts": self.timestamp,
-        }
-
-
-class CDCLog:
-    """An append-only log of ChangeEvents.
-
-    The log is the single source of truth for derived systems.
-    Nothing is ever deleted from this log.
-    """
-    def __init__(self):
-        self._events: list[ChangeEvent] = []
-
-    def append(self, event: ChangeEvent) -> None:
-        # In a real system this would be an offset commit against the DB.
-        self._events.append(event)
-
-    def from_offset(self, offset: int) -> Iterable[ChangeEvent]:
-        # Replay the log from a given offset (used for catch-up).
-        return iter(self._events[offset:])
-
-    @property
-    def latest_offset(self) -> int:
-        return len(self._events)
-
+    offset: int
+    key: str
+    op: str        # "insert" | "update" | "delete"
+    before: dict
+    after: dict
 
 class DerivedConsumer:
-    """A consumer that maintains a derived view over a CDCLog.
-
-    The derived state is a pure function of the events applied to it,
-    so it can be rebuilt at any time by replaying the log.
-    """
-    def __init__(self, name: str, log: CDCLog, reducer: Callable[[Dict, ChangeEvent], Dict]):
-        self.name = name
-        self.log = log
+    """Applies a deterministic reducer to each event in the log."""
+    def __init__(self, reducer):
         self.reducer = reducer
-        self.state: Dict[str, Any] = {}
+        self.state = {}
         self.applied_offset = 0
 
-    def catch_up(self) -> None:
-        """Replay all events since the last applied offset."""
-        for event in self.log.from_offset(self.applied_offset):
-            self.apply(event)
-
     def apply(self, event: ChangeEvent) -> None:
-        """Apply one event deterministically to the local state."""
         self.state = self.reducer(self.state, event)
         self.applied_offset = event.offset + 1
 
     def rebuild(self) -> None:
-        """Discard local state and replay the entire log from scratch."""
-        self.state = {}
-        self.applied_offset = 0
-        self.catch_up()
-
-
-# Example reducer: builds a secondary index on a `city` column.
-def index_by_city(state: Dict, event: ChangeEvent) -> Dict:
-    city = event.after.get("city") or event.before.get("city")
-    if city is None:
-        return state
-    state.setdefault(city, set())
-    if event.op in ("insert", "update"):
-        state[city].add(event.key)
-    elif event.op == "delete":
-        state[city].discard(event.key)
-    return state
-
-
-if __name__ == "__main__":
-    log = CDCLog()
-    log.append(ChangeEvent(0, "user:1", "insert", {}, {"name": "Alice", "city": "Berlin"}))
-    log.append(ChangeEvent(1, "user:2", "insert", {}, {"name": "Bob", "city": "Paris"}))
-    log.append(ChangeEvent(2, "user:1", "update",
-                           {"name": "Alice", "city": "Berlin"},
-                           {"name": "Alice", "city": "Munich"}))
-
-    consumer = DerivedConsumer("city-index", log, index_by_city)
-    consumer.catch_up()
-    print("State after replay:", consumer.state)
-    # {"Berlin": set(), "Paris": {"user:2"}, "Munich": {"user:1"}}
+        self.state, self.applied_offset = {}, 0
+        # Replay the entire log from offset 0.
 ```
+
+The full implementation, with the `CDCLog` and reducer functions, lives in `examples/ch13/cdc_consumer.py`.
 
 ### 1.3 Derived Data vs Distributed Transactions
 
@@ -278,9 +202,9 @@ The classic alternative to derived data is **distributed transactions across het
 | Cross-vendor support | Limited (XA rarely implemented end-to-end) | Easy (everyone can read a log) |
 | Operational robustness | Poor; cascading failures | Good; faults are localized |
 
-The reason derived data has won the practical battle is not that it is theoretically superior. It is that the assumptions of distributed transactions—homogeneous implementations, a single trusted coordinator, bounded latency—do not hold once the components of the system are owned by different teams and run on different machines across different geographies. The event log works in spite of heterogeneity, because every consumer just needs to read bytes from a stream.
+The reason derived data has won the practical battle is not that it is theoretically superior. It is that the assumptions of distributed transactions — homogeneous implementations, a single trusted coordinator, bounded latency — do not hold once the components of the system are owned by different teams and run on different machines across different geographies. The event log works in spite of heterogeneity, because every consumer just needs to read bytes from a stream.
 
-The cost is that you no longer get read-your-writes for free. A user who updates their profile and immediately reloads the page may not see their update, because the search index update is asynchronous. To bridge that gap, we have to add explicit mechanisms: a synchronously-writable profile database that the application can read immediately, plus an asynchronous pipeline that propagates the same write to all derived views. That is a perfectly reasonable trade-off, but it does require thinking.
+The cost is that you no longer get read-your-writes for free. A user who updates their profile and immediately reloads the page may not see their update, because the search index update is asynchronous. To bridge that gap, we have to add explicit mechanisms: a synchronously-writable profile database that the application can read immediately, plus an asynchronous pipeline that propagates the same write to all derived systems. That is a perfectly reasonable trade-off, but it does require thinking.
 
 ### 1.4 The Limits of Total Ordering
 
@@ -326,7 +250,7 @@ When total order is unavailable, we still want to preserve **causal ordering**: 
 
 Three techniques help in this situation:
 
-1. **Logical timestamps.** Lamport timestamps or vector clocks provide a partial order without coordination. Recipients can detect causal dependencies.
+1. **Logical timestamps.** Lamport timestamps or vector clocks (see Chapter 10) provide a partial order without coordination. Recipients can detect causal dependencies.
 2. **Causal IDs.** Each event records the IDs of the events it causally depended on. Downstream consumers use these IDs to reconstruct dependencies.
 3. **Conflict resolution at read.** When events are delivered in an unexpected order, the application uses CRDT-style merge logic to converge.
 
@@ -359,9 +283,9 @@ This is still an open research area. The cleanest production approach is to rout
 
 ## 2. Batch and Stream Processing
 
-### 2.1 Maintaining Derived State
+### 2.1 Maintaining Derived Data
 
-The fundamental operation in a data integration system is **derivation**: take a source dataset, apply a transformation, write the result somewhere. The transformation is what database people call a **view** or a **materialized view**, but it can be more elaborate: a full-text index, a feature store for ML, a cache of an expensive computation, an aggregate metric.
+The fundamental operation in a data integration system is **derivation**: take a source dataset, apply a transformation, write the result somewhere. The transformation is what database people call a **view** or a **materialized view** (see Chapter 11), but it can be more elaborate: a full-text index, a feature store for ML, a cache of an expensive computation, an aggregate metric.
 
 Two flavors of the same idea exist:
 
@@ -384,7 +308,7 @@ graph LR
     style S_JOB fill:#87CEEB
 ```
 
-Both styles benefit from asynchrony. If we tried to maintain a derived view synchronously (in the same transaction as the source write), we would couple the source system's availability to the derived system's availability. A slow or failing derived system would block writes. By making derivation asynchronous, we decouple the two: the source can keep accepting writes even if a derived consumer is offline, because the events are buffered in the log.
+Both styles benefit from asynchrony. If we tried to maintain derived data synchronously (in the same transaction as the source write), we would couple the source system's availability to the derived system's availability. A slow or failing derived system would block writes. By making derivation asynchronous, we decouple the two: the source can keep accepting writes even if a derived consumer is offline, because the events are buffered in the log.
 
 The downside of asynchrony is that reads of the derived system are eventually consistent. That is fine for many workloads (a search index that lags by a few seconds is fine; a search index that lags by hours is probably also fine), but it does not work for every workload. We will return to this tension in the correctness section.
 
@@ -411,38 +335,13 @@ graph LR
 
 This is exactly the kind of evolution that would be impossible if the search index had been built directly from application writes. In that world, the application would have to be modified, redeployed, and the index rebuilt from a snapshot of the database. With the derived-data approach, the change is local to one transformation in the pipeline.
 
-**Example: railway gauge migration.** In 19th-century England, different railway companies used different track gauges. When the government finally standardized on one gauge in 1846, every track had to be converted—but you cannot shut down a railway line for months while you rip up the rails. The engineers solved this by adding a third rail to make the track dual-gauge, then gradually switching all the rolling stock to the new gauge, then finally removing the obsolete rail. The transition took years and was entirely reversible at every stage.
+**Example: railway gauge migration.** In 19th-century England, different railway companies used different track gauges. When the government finally standardized on one gauge in 1846, every track had to be converted — but you cannot shut down a railway line for months while you rip up the rails. The engineers solved this by adding a third rail to make the track dual-gauge, then gradually switching all the rolling stock to the new gauge, then finally removing the obsolete rail. The transition took years and was entirely reversible at every stage.
 
 Software systems can evolve the same way. Maintain both an old and a new schema side-by-side. Route 1% of users to the new view. If everything works, gradually increase to 10%, 50%, 100%. Every stage is reversible. The cost of failure is bounded.
 
 ### 2.3 Unifying Batch and Stream Processing
 
-For a long time, the practical answer to "how do I process historical data and live data?" was the **lambda architecture**. It runs two systems in parallel: a batch system for historical reprocessing, and a stream system for low-latency updates. Queries merge the outputs of both.
-
-```mermaid
-graph TB
-    subgraph "Lambda Architecture"
-        SRC["Source Events"]
-        BATCH["Batch Layer<br/>(Hadoop, Spark)"]
-        STREAM["Speed Layer<br/>(Storm, Flink)"]
-        SERVING["Serving Layer<br/>(merge batch + stream)"]
-        QUERY["Query"]
-
-        SRC --> BATCH
-        SRC --> STREAM
-        BATCH --> SERVING
-        STREAM --> SERVING
-        SERVING --> QUERY
-    end
-
-    style BATCH fill:#87CEEB
-    style STREAM fill:#FFB6C1
-    style SERVING fill:#FFD700
-```
-
-The lambda architecture works, but it has a well-known problem: the code for the batch layer and the speed layer has to be written twice, in two different frameworks, and kept in sync. Bugs appear in one but not the other, and reconciling them is painful.
-
-The **kappa architecture** says: run a single stream processing system that is powerful enough to also handle batch workloads. Concretely:
+The two processing styles are so similar in principle that the practical recommendation is to run **a single stream processing system that is also capable of batch workloads** — this is the **kappa architecture** [Kreps, 2014]. Concretely:
 
 - The same engine processes historical events (replay from the log) and live events (consume from the head of the log).
 - The engine has **exactly-once semantics**, so failures do not produce duplicate outputs.
@@ -469,7 +368,7 @@ Three capabilities make this possible:
 2. **Exactly-once.** Stream processors can guarantee that the output is the same as if no faults occurred, by discarding partial outputs of failed tasks and replaying the inputs.
 3. **Event-time windows.** When you reprocess history, "now" is undefined. The engine must let you compute windowed aggregates based on the timestamps of the events themselves.
 
-Systems like Apache Flink, Apache Beam (with runners), and Google Cloud Dataflow all meet these criteria, and they have largely displaced the lambda pattern.
+Systems like Apache Flink, Apache Beam (with runners), and Google Cloud Dataflow all meet these criteria, and they have largely displaced the older two-stack pattern (the lambda architecture, which ran a separate batch and stream system). For the mechanics of batch processing and the trade-offs with the stream variant, see Chapter 11.
 
 ---
 
@@ -477,7 +376,7 @@ Systems like Apache Flink, Apache Beam (with runners), and Google Cloud Dataflow
 
 ### 3.1 Composing Data Storage Technologies
 
-Looking at the features that databases provide internally—secondary indexes, materialized views, replication logs, full-text search—we see a striking pattern. Each of those features is itself a derivation of the base data. An index is derived by sorting. A materialized view is derived by aggregation. A replication log is derived by tailing the write-ahead log.
+Looking at the features that databases provide internally — secondary indexes, materialized views, replication logs, full-text search — we see a striking pattern. Each of those features is itself a derivation of the base data. An index is derived by sorting. A materialized view is derived by aggregation. A replication log is derived by tailing the write-ahead log.
 
 ```mermaid
 graph LR
@@ -501,7 +400,7 @@ graph LR
 
 Now look at the dataflow systems we have been discussing. CDC tools capture the replication log and feed it into Kafka. Stream processors build secondary indexes. Batch jobs build materialized views. Specialized search tools build full-text indexes.
 
-The resemblance is more than superficial. **A modern dataflow stack is a database, with its internal subsystems unbundled and exposed as standalone tools.** Every time you read from Kafka, transform with Flink, and write to Elasticsearch, you are doing exactly what a single integrated database does internally—but you have chosen each tool from a different vendor, and you can compose them with application code.
+The resemblance is more than superficial. **A modern dataflow stack is a database, with its internal subsystems unbundled and exposed as standalone tools.** Every time you read from Kafka, transform with Flink, and write to Elasticsearch, you are doing exactly what a single integrated database does internally — but you have chosen each tool from a different vendor, and you can compose them with application code.
 
 **Example: the meta-database.** Imagine the totality of an organization's data movement: every batch job, every ETL pipeline, every CDC stream. Viewed from above, this looks like one massive database. The OLTP systems are its tables. The CDC logs are its write-ahead logs. The batch jobs are its materialized view maintainers. The streaming pipelines are its trigger system. The search indices are its full-text indexes. The cache layers are its buffer pool.
 
@@ -574,9 +473,9 @@ graph TB
     style WAREHOUSE fill:#FFB6C1
 ```
 
-In this picture, the application writes to exactly one place (the log). The log is consumed by multiple specialized engines, each maintaining its own derived view. To "update the search index," the application writes a CDC event to the log; a separate consumer applies that event to Elasticsearch.
+In this picture, the application writes to exactly one place (the log). The log is consumed by multiple specialized engines, each maintaining its own derived data. To "update the search index," the application writes a CDC event to the log; a separate consumer applies that event to Elasticsearch.
 
-This is the **Unix philosophy** applied to data systems: small tools that do one thing well, communicating through a uniform low-level abstraction (the log), composable into larger systems by application code.
+This is the **Unix philosophy** applied to data systems: small tools that do one thing well, communicating through a uniform low-level abstraction (the log), composable into larger systems by application code [Kleppmann and Kreps, 2015].
 
 The two approaches are not in opposition. A mature data architecture typically uses **both**:
 
@@ -612,7 +511,7 @@ graph TB
 
 ### 3.4 Making Unbundling Work
 
-The hardest problem in unbundled systems is **synchronizing writes across heterogeneous engines**. Distributed transactions (XA) are the traditional answer, and they have well-known limitations:
+The hardest problem in unbundled systems is **synchronizing writes across heterogeneous engines**. Distributed transactions (XA, see Chapter 8) are the traditional answer, and they have well-known limitations:
 
 - They require synchronous coordination across all participants.
 - They are sensitive to failures: any participant failure aborts the whole transaction.
@@ -625,76 +524,28 @@ The log-based approach replaces distributed transactions with **idempotent consu
 2. For each event, performs an idempotent operation on its local engine.
 3. Tracks its offset in the log so it can resume after a crash.
 
+The idempotency concept itself is introduced in Chapter 12; a self-contained example consumer is shown below.
+
 ```python
-import hashlib
-import json
-from typing import Optional, Dict, Any
-
-# Demonstrates an idempotent consumer for a derived store.
-# In production this would wrap Elasticsearch, Redis, Postgres, etc.
-
 class IdempotentDerivedWriter:
-    """Writes events to a derived store in a way that is safe to retry.
+    """Writes events to a derived engine in a way that is safe to retry.
 
     Idempotence is achieved by recording the set of processed event IDs
     and rejecting duplicates. This works across crashes and consumer restarts.
     """
+    def __init__(self):
+        self.processed = set()
+        self.state = {}
 
-    def __init__(self, name: str):
-        self.name = name
-        self.processed: set[str] = set()
-        self.state: Dict[str, Any] = {}
-
-    def handle(self, event_id: str, key: str, payload: Dict[str, Any]) -> Optional[Dict]:
-        # Idempotency check: skip if we have already processed this event ID.
+    def handle(self, event_id, key, payload):
         if event_id in self.processed:
-            return None
-        # Apply the event deterministically.
+            return None        # duplicate; skip
         self.state[key] = payload
-        # Record that we have processed this event.
         self.processed.add(event_id)
         return {"key": key, "payload": payload}
-
-    def is_idempotent_after_replay(self, events) -> bool:
-        """Replay the same events and check that the final state is identical."""
-        # Snapshot before replay
-        before = json.dumps(self.state, sort_keys=True)
-        before_processed = set(self.processed)
-        # Reset
-        self.state = {}
-        self.processed = set()
-        # Replay
-        for ev in events:
-            self.handle(ev["event_id"], ev["key"], ev["payload"])
-        after = json.dumps(self.state, sort_keys=True)
-        # Restore
-        self.state = json.loads(before)
-        self.processed = before_processed
-        return before == after
-
-
-def make_event_id(payload: dict) -> str:
-    """Stable hash-based ID for an event payload."""
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
-
-
-if __name__ == "__main__":
-    events = [
-        {"event_id": "e1", "key": "user:1", "payload": {"name": "Alice"}},
-        {"event_id": "e2", "key": "user:2", "payload": {"name": "Bob"}},
-        {"event_id": "e3", "key": "user:1", "payload": {"name": "AliceUpdated"}},
-    ]
-
-    writer = IdempotentDerivedWriter("search-index")
-
-    # Simulate duplicate delivery (Kafka at-least-once).
-    for ev in events + events:
-        writer.handle(ev["event_id"], ev["key"], ev["payload"])
-
-    print("Final state:", writer.state)
-    # Only one entry per key, no matter how many times we replayed.
-    print("Idempotent after replay:", writer.is_idempotent_after_replay(events))
 ```
+
+The full demo (with `is_idempotent_after_replay` and a duplicate-delivery test) lives in `examples/ch13/idempotent_writer.py`.
 
 The benefit is **loose coupling**: at the system level, asynchronous event streams make the system robust to outages or slow performance of individual consumers. If a consumer is down, the log buffers messages, and the producer and other consumers are unaffected. At the human level, unbundling lets different teams own different consumers, with well-defined interfaces (the log schema) between them.
 
@@ -851,7 +702,7 @@ graph LR
 Two properties are essential:
 
 1. **Stable ordering.** When multiple views are derived from the same event log, they must process events in the same order, or they will diverge.
-2. **Fault tolerance.** Losing a single message means the derived view goes permanently out of sync with its source. Both delivery and processing must be reliable.
+2. **Fault tolerance.** Losing a single message means the derived data goes permanently out of sync with its source. Both delivery and processing must be reliable.
 
 Modern stream processors provide these properties at scale. The application code itself becomes a stream operator, embedded in the dataflow.
 
@@ -892,25 +743,25 @@ This is one of many places where stream processing and dataflow thinking pay off
 
 Every derived data system has two sides:
 
-- The **write path** is what happens when data is created or updated. The system processes the event, applies transformations, and updates the derived view.
-- The **read path** is what happens when someone queries the system. The system uses the derived view to construct a response.
+- The **write path** is what happens when data is created or updated. The system processes the event, applies transformations, and updates the derived data.
+- The **read path** is what happens when someone queries the system. The system uses the derived data to construct a response.
 
 ```mermaid
 graph TB
     subgraph "Write Path (eager)"
         W1["Event arrives"]
         W2["Process"]
-        W3["Update derived view"]
+        W3["Update derived data"]
         W4["Materialize on disk"]
     end
 
     subgraph "Read Path (lazy)"
         R1["Query arrives"]
-        R2["Read derived view"]
+        R2["Read derived data"]
         R3["Compute response"]
     end
 
-    VIEW["Derived View<br/>(shared boundary)"]
+    VIEW["Derived Data<br/>(shared boundary)"]
 
     W1 --> W2 --> W3 --> W4 --> VIEW
     R1 --> R2 --> R3 --> VIEW
@@ -918,12 +769,12 @@ graph TB
     style VIEW fill:#FFD700
 ```
 
-The derived view itself is the boundary between the write path and the read path. The choice of where to draw this boundary is one of the most consequential design decisions in a data system.
+The derived data itself is the boundary between the write path and the read path. The choice of where to draw this boundary is one of the most consequential design decisions in a data system.
 
 **Example: search index.** When a document is added:
 
 - The write path extracts terms, applies stemming, removes stop words, and adds entries to the index.
-- The read path takes a query, looks up each term, intersects/intersects the result sets, ranks them, and returns the top hits.
+- The read path takes a query, looks up each term, intersects the result sets, ranks them, and returns the top hits.
 
 The work split is determined by the index. Without an index, the read path would have to scan every document (grep-style), but the write path would have nothing to do. With a precomputed result for every possible query, the read path would just look up the answer, but the write path would be impossibly expensive (there are exponentially many possible queries).
 
@@ -955,7 +806,7 @@ The famous Twitter example from Chapter 2 illustrates this trade-off in practice
 
 ### 5.2 Materialized Views and Caching
 
-A **materialized view** is the database's name for a precomputed query result. A **cache** is the application's name for a precomputed query result. They are the same thing: a derived view that is updated eagerly on writes, queried on reads.
+A **materialized view** is the database's name for a precomputed query result. A **cache** is the application's name for a precomputed query result. They are the same thing: derived data that is updated eagerly on writes, queried on reads.
 
 ```mermaid
 graph TB
@@ -977,7 +828,7 @@ graph TB
     style CACHE2 fill:#87CEEB
 ```
 
-In all cases, the maintenance story is the same: when the base data changes, the derived view must be updated. The harder the query, the more benefit you get from materialization (because you save the expensive read-time work) and the more pain you suffer from maintenance (because the write-path work grows).
+In all cases, the maintenance story is the same: when the base data changes, the derived data must be updated. The harder the query, the more benefit you get from materialization (because you save the expensive read-time work) and the more pain you suffer from maintenance (because the write-path work grows). Materialized views are introduced in Chapter 11.
 
 Modern incremental view maintenance engines (e.g., Materialize, Noria, Apache Pinot's upsert tables, Apache Calcite's IVM algorithms) keep materialized views in sync as the base data changes, without recomputing everything from scratch.
 
@@ -1034,7 +885,7 @@ sequenceDiagram
     Note over C: state is now stale!
 
     Note over C,S: SSE / WebSocket (new): push
-    C->>S: open connection
+    C->>C: open connection
     loop While connected
         S->>C: event 1
         S->>C: event 2
@@ -1120,7 +971,7 @@ If the same request ID arrives twice, the second `INSERT` fails on the uniquenes
 
 ### 6.2 The End-to-End Argument
 
-This pattern is an instance of a more general principle, **the end-to-end argument** (Saltzer, Reed, and Clark, 1984):
+This pattern is an instance of a more general principle, **the end-to-end argument** [Saltzer, Reed, and Clark, 1984]:
 
 > "The function in question can completely and correctly be implemented only with the knowledge and help of the application standing at the endpoints of the communication system. Therefore, providing that questioned function as a feature of the communication system itself is not possible. Sometimes an incomplete version of the function provided by the communication system may be useful as a performance enhancement."
 
@@ -1130,68 +981,19 @@ Examples:
 - **TLS encrypts data in transit**, but it cannot prevent a malicious server from reading the data after decryption. End-to-end encryption is required for true confidentiality.
 - **Ethernet checksums detect packet corruption**, but they cannot detect corruption at the endpoints or on disk. End-to-end checksums are required to detect all corruption.
 
-```mermaid
-graph LR
-    subgraph "Network layer (TCP)"
-        L1["suppress duplicates<br/>within one connection"]
-    end
-
-    subgraph "Database layer"
-        L2["transactions, integrity<br/>within one DB"]
-    end
-
-    subgraph "Stream processor"
-        L3["exactly-once<br/>within one pipeline"]
-    end
-
-    subgraph "Application layer (E2E)"
-        L4["request IDs<br/>across all hops"]
-    end
-
-    L1 -.->|"incomplete on its own"| L4
-    L2 -.->|"incomplete on its own"| L4
-    L3 -.->|"incomplete on its own"| L4
-
-    style L4 fill:#FFD700
-```
-
-In data systems, the same logic applies. A database with serializable transactions does not, by itself, prevent duplicate logical requests from being processed twice. A stream processor with exactly-once semantics does not, by itself, prevent a user from double-clicking. The application must add end-to-end deduplication, with request IDs that travel through every layer.
+In data systems, the same logic applies. A database with serializable transactions does not, by itself, prevent duplicate logical requests from being processed twice. A stream processor with exactly-once semantics does not, by itself, prevent a user from double-clicking. The application must add end-to-end deduplication, with request IDs that travel through every layer. Integrity checks at every intermediate layer — Ethernet checksums, disk checksums, database transactions, exactly-once stream pipelines — are individually useful but each is incomplete: only an end-to-end check, applied to the data flowing through the entire pipeline, can catch corruption or duplication that escapes any single layer.
 
 ### 6.3 Enforcing Constraints Across Systems
 
 Constraints like uniqueness (a username is unique, an email is unique, two people cannot book the same seat) are usually enforced inside a single database. What happens when the constraint spans multiple systems?
 
+A stream-based uniqueness check on a username claim:
+
 ```python
-import hashlib
-from dataclasses import dataclass
-from typing import Dict, Optional, List
-
-# Demonstrates a stream-based uniqueness check for a username claim.
-# The principle is the same as a single-DB unique constraint, but the
-# "database" here is a stateful stream processor over a sharded log.
-
-@dataclass
-class UsernameRequest:
-    request_id: str
-    user_id: str
-    username: str
-    timestamp: float
-
-
-@dataclass
-class UsernameResponse:
-    request_id: str
-    user_id: str
-    username: str
-    accepted: bool
-    reason: Optional[str] = None
-
-
-def shard_for(username: str, num_shards: int = 16) -> int:
+def shard_for(username, num_shards=16):
     """Route by hash of username so all claims for the same name hit one shard."""
     h = int(hashlib.sha256(username.encode()).hexdigest(), 16)
     return h % num_shards
-
 
 class UsernameShardProcessor:
     """One shard's worth of username state.
@@ -1200,79 +1002,23 @@ class UsernameShardProcessor:
     so they are processed sequentially. This guarantees a deterministic
     decision on which request wins.
     """
+    def __init__(self):
+        self.taken = {}     # username -> user_id of winner
+        self.processed = set()
 
-    def __init__(self, shard_id: int):
-        self.shard_id = shard_id
-        self.taken: Dict[str, str] = {}   # username -> user_id of winner
-        self.processed: set = set()       # request_ids already seen
-
-    def handle(self, req: UsernameRequest) -> UsernameResponse:
-        # Idempotency: same request_id never produces a different result.
-        if req.request_id in self.processed:
-            owner = self.taken.get(req.username)
-            return UsernameResponse(
-                request_id=req.request_id,
-                user_id=req.user_id,
-                username=req.username,
-                accepted=(owner == req.user_id),
-                reason="duplicate request",
-                )
-
-        self.processed.add(req.request_id)
-        owner = self.taken.get(req.username)
-        if owner is None:
-            # First claim wins.
-            self.taken[req.username] = req.user_id
-            return UsernameResponse(
-                request_id=req.request_id,
-                user_id=req.user_id,
-                username=req.username,
-                accepted=True,
-                )
-        elif owner == req.user_id:
-            # Same user re-claiming their own username.
-            return UsernameResponse(
-                request_id=req.request_id,
-                user_id=req.user_id,
-                username=req.username,
-                accepted=True,
-                reason="already owner",
-                )
-        else:
-            return UsernameResponse(
-                request_id=req.request_id,
-                user_id=req.user_id,
-                username=req.username,
-                accepted=False,
-                reason=f"already taken by {owner}",
-                )
-
-
-def process_usernames(requests: List[UsernameRequest]) -> List[UsernameResponse]:
-    """Route requests to shards and process each shard sequentially."""
-    shards: Dict[int, UsernameShardProcessor] = {}
-    responses: List[UsernameResponse] = []
-    # In a real system, processing order within a shard matters. Here we
-    # sort by timestamp to simulate that.
-    requests = sorted(requests, key=lambda r: r.timestamp)
-    for req in requests:
-        s = shard_for(req.username)
-        if s not in shards:
-            shards[s] = UsernameShardProcessor(s)
-        responses.append(shards[s].handle(req))
-    return responses
-
-
-if __name__ == "__main__":
-    reqs = [
-        UsernameRequest("r1", "user:alice", "alice", 1.0),
-        UsernameRequest("r2", "user:bob",   "alice", 2.0),  # collision!
-        UsernameRequest("r3", "user:alice", "alice", 3.0),  # alice retries
-        UsernameRequest("r4", "user:bob",   "bob",   4.0),
-    ]
-    for resp in process_usernames(reqs):
-        print(f"{resp.username} by {resp.user_id}: accepted={resp.accepted} ({resp.reason})")
+    def handle(self, request_id, user_id, username):
+        if request_id in self.processed:
+            owner = self.taken.get(username)
+            return {"accepted": owner == user_id, "reason": "duplicate request"}
+        self.processed.add(request_id)
+        owner = self.taken.get(username)
+        if owner is None or owner == user_id:
+            self.taken[username] = user_id
+            return {"accepted": True}
+        return {"accepted": False, "reason": f"already taken by {owner}"}
 ```
+
+The full multi-shard driver, with routing and a worked example showing two users racing for the same username, lives in `examples/ch13/username_uniqueness.py`.
 
 The key insight is **routing all conflicting requests to the same shard**, then processing them sequentially on a single thread. Within one shard, the order is total, so the constraint is unambiguous. Across shards, the constraint does not apply, so the shards can be processed in parallel.
 
@@ -1313,93 +1059,25 @@ The flow:
 
 Atomicity comes from the fact that writing the initial request event to the source shard log is atomic. Once that one event is in the log, all the downstream events will eventually be processed. They may be duplicated, but each downstream processor deduplicates by `request_id`. They may be out of order, but each downstream processor is deterministic and stateful, so it converges to the right answer.
 
+A minimal per-shard reducer for one account:
+
 ```python
-import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Set, Optional
-
-
-@dataclass(frozen=True)
-class AccountEvent:
-    """An event on an account's log."""
-    offset: int
-    request_id: str
-    type: str       # "RESERVE", "OUTGOING", "INCOMING", "EXECUTE"
-    amount: float = 0.0
-    counterparty: Optional[str] = None
-
-
-@dataclass
-class AccountState:
-    """Local state for one account shard."""
-    balance: float = 0.0
-    seen_request_ids: Set[str] = field(default_factory=set)
-    reservations: Dict[str, float] = field(default_factory=dict)  # request_id -> amount
-
-    def apply(self, event: AccountEvent, account_id: str) -> List[AccountEvent]:
-        """Apply an event to local state, return any events to emit downstream."""
-        if event.request_id in self.seen_request_ids:
-            return []  # duplicate; skip
-        self.seen_request_ids.add(event.request_id)
-
-        if event.type == "RESERVE":
-            if self.balance >= event.amount:
-                self.reservations[event.request_id] = event.amount
-                self.balance -= event.amount
-                return [AccountEvent(
-                    offset=0,
-                    request_id=event.request_id,
-                    type="OUTGOING",
-                    amount=event.amount,
-                    counterparty=account_id,
-                )]
-            return []  # insufficient funds
-
-        if event.type == "EXECUTE":
-            # Reservation was previously made; remove it.
-            self.reservations.pop(event.request_id, None)
-            return []
-
-        if event.type == "INCOMING":
-            self.balance += event.amount
-            return []
-
-        return []
-
-
-def process_account(account_id: str, initial_balance: float, events: List[AccountEvent]):
-    """Replay events for one account shard and return final state."""
-    state = AccountState(balance=initial_balance)
-    for ev in sorted(events, key=lambda e: e.offset):
-        emitted = state.apply(ev, account_id)
-        # In a real system, emitted events would be appended to other shards' logs.
-        # For this demo we just log them.
-        for e in emitted:
-            print(f"  -> emit {e.type} to {e.counterparty} (request_id={e.request_id})")
-    print(f"Account {account_id}: balance={state.balance}, reservations={state.reservations}")
-
-
-if __name__ == "__main__":
-    # Source account receives a RESERVE for $11.
-    src_events = [
-        AccountEvent(offset=0, request_id="r-001", type="RESERVE", amount=11.0),
-        AccountEvent(offset=1, request_id="r-001", type="INCOMING", amount=11.0, counterparty="dest"),
-        AccountEvent(offset=2, request_id="r-001", type="INCOMING", amount=1.0, counterparty="fees"),
-        AccountEvent(offset=3, request_id="r-001", type="EXECUTE", amount=11.0),
-    ]
-    process_account("source", initial_balance=100.0, events=src_events)
-
-    # Destination and fees accounts receive incoming payments.
-    dest_events = [
-        AccountEvent(offset=0, request_id="r-001", type="INCOMING", amount=11.0, counterparty="source"),
-    ]
-    process_account("dest", initial_balance=0.0, events=dest_events)
-
-    fees_events = [
-        AccountEvent(offset=0, request_id="r-001", type="INCOMING", amount=1.0, counterparty="source"),
-    ]
-    process_account("fees", initial_balance=0.0, events=fees_events)
+def apply(state, event):
+    """Process one AccountEvent against local state, returning new state."""
+    if event.request_id in state.seen_request_ids:
+        return state                                  # duplicate; skip
+    state.seen_request_ids.add(event.request_id)
+    if event.type == "RESERVE" and state.balance >= event.amount:
+        state.reservations[event.request_id] = event.amount
+        state.balance -= event.amount
+    elif event.type == "INCOMING":
+        state.balance += event.amount
+    elif event.type == "EXECUTE":
+        state.reservations.pop(event.request_id, None)
+    return state
 ```
+
+The full walkthrough, with a three-shard demo that traces the events from `r-001` through reserve, two incoming payments, and execute, lives in `examples/ch13/multi_shard_payment.py`.
 
 This pattern works **without an atomic commit protocol**. The cost is that the application is more complex: you must reason about partial states during processing, design for idempotency, and accept that the system is eventually consistent. The benefit is that you can scale across shards, regions, and even organizations without paying the cost of synchronous cross-shard coordination.
 
@@ -1414,7 +1092,7 @@ We have been treating "consistency" as a single concept, but it is really two:
 graph TB
     CONS["Consistency"]
     CONS --> TIME["Timeliness<br/>('is it fresh?')"]
-    CONS --> INT["Integrity<br/>("'is it correct?')"]
+    CONS --> INT["Integrity<br/>('is it correct?')"]
 
     style TIME fill:#87CEEB
     style INT fill:#90EE90
@@ -1448,7 +1126,7 @@ Examples of rare-but-real integrity violations:
 - PostgreSQL's serializable isolation has exhibited write-skew anomalies in past versions.
 - CPUs occasionally produce wrong results from arithmetic operations due to hardware faults.
 
-Application code, which receives far less scrutiny than database internals, has even more bugs. Many applications do not even correctly use the integrity features their database provides: foreign-key constraints, unique constraints, transaction boundaries. An empirical study (Bailis et al., "Feral Concurrency Control") found widespread misuse of database isolation levels in production code.
+Application code, which receives far less scrutiny than database internals, has even more bugs. Many applications do not even correctly use the integrity features their database provides: foreign-key constraints, unique constraints, transaction boundaries. An empirical study [Bailis et al., 2014] found widespread misuse of database isolation levels in production code.
 
 ### 7.2 Designing for Auditability
 
@@ -1481,25 +1159,21 @@ A complete audit story has several layers:
 2. **Reprocessing of derived state.** Periodically rerun derivation code from the log and compare to the live state.
 3. **Cross-checks between derived systems.** If two derived systems are supposed to reflect the same data, sample-check that they agree.
 
-```python
-import hashlib
-import json
-import time
-from dataclasses import dataclass, field
-from typing import List, Optional
+A minimal hash-chained audit log:
 
+```python
+import hashlib, json, time
+from dataclasses import dataclass, field
 
 @dataclass
 class AuditEvent:
-    """An event in an auditable log, linked to the previous event by hash."""
     offset: int
     payload: dict
     timestamp: float = field(default_factory=time.time)
-    prev_hash: Optional[str] = None
-    event_hash: Optional[str] = None
+    prev_hash: str | None = None
+    event_hash: str | None = None
 
-    def finalize(self) -> None:
-        """Compute the hash linking this event to the previous one."""
+    def finalize(self):
         body = json.dumps({
             "offset": self.offset,
             "payload": self.payload,
@@ -1507,64 +1181,9 @@ class AuditEvent:
             "prev_hash": self.prev_hash,
         }, sort_keys=True).encode()
         self.event_hash = hashlib.sha256(body).hexdigest()
-
-
-class AuditLog:
-    """An append-only log with hash-chained integrity.
-
-    Tampering with any event breaks the chain at that point and at every
-    subsequent event. A periodic verifier can detect the discrepancy.
-    """
-    def __init__(self):
-        self.events: List[AuditEvent] = []
-
-    def append(self, payload: dict) -> AuditEvent:
-        prev_hash = self.events[-1].event_hash if self.events else None
-        ev = AuditEvent(
-            offset=len(self.events),
-            payload=payload,
-            prev_hash=prev_hash,
-        )
-        ev.finalize()
-        self.events.append(ev)
-        return ev
-
-    def verify(self) -> bool:
-        """Walk the log and confirm each event's hash matches its content."""
-        for i, ev in enumerate(self.events):
-            expected_prev = self.events[i - 1].event_hash if i > 0 else None
-            if ev.prev_hash != expected_prev:
-                return False
-            # Recompute the hash from the stored fields.
-            body = json.dumps({
-                "offset": ev.offset,
-                "payload": ev.payload,
-                "timestamp": ev.timestamp,
-                "prev_hash": ev.prev_hash,
-            }, sort_keys=True).encode()
-            actual = hashlib.sha256(body).hexdigest()
-            if actual != ev.event_hash:
-                return False
-        return True
-
-
-def demo_audit_tampering():
-    """Show that a tampered event breaks the hash chain."""
-    log = AuditLog()
-    log.append({"type": "user.created", "id": 1, "name": "Alice"})
-    log.append({"type": "user.created", "id": 2, "name": "Bob"})
-    log.append({"type": "transfer", "from": 1, "to": 2, "amount": 11.0})
-
-    print("Intact log verifies:", log.verify())
-
-    # Now tamper with an event's payload.
-    log.events[1].payload["name"] = "Eve"
-    print("Tampered log verifies:", log.verify())
-
-
-if __name__ == "__main__":
-    demo_audit_tampering()
 ```
+
+The full implementation, with the `AuditLog.append()` / `verify()` methods and a tampering-detection demo, lives in `examples/ch13/audit_log.py`.
 
 ### 7.3 Self-Auditing Systems
 
@@ -1572,7 +1191,7 @@ Large-scale storage systems already do this kind of continuous auditing. HDFS ru
 
 This **trust-but-verify** philosophy is rare in mainstream databases. Most databases trust the disk, trust the memory, trust the operating system, and trust themselves. If corruption occurs, you find out only when a query returns garbage or a checksum fails on read.
 
-The trend in the industry is toward more self-validating systems. Cryptographic tools borrowed from blockchains—**Merkle trees**, hash-linked logs, signed transactions—can verify the integrity of stored data with strong guarantees. **Certificate Transparency** uses these techniques to verify the global log of TLS certificates; the same ideas could verify a database log.
+The trend in the industry is toward more self-validating systems. Cryptographic tools borrowed from blockchains — **Merkle trees**, hash-linked logs, signed transactions — can verify the integrity of stored data with strong guarantees. **Certificate Transparency** uses these techniques to verify the global log of TLS certificates; the same ideas could verify a database log.
 
 ```mermaid
 graph LR
@@ -1595,19 +1214,11 @@ graph LR
 
 The cost of these techniques is non-trivial: cryptographic operations are CPU-expensive, and Merkle proofs add bytes to every operation. But for systems whose data is hard to replace (financial records, medical records, government records), the cost is worth it.
 
-### 7.4 The End-to-End Argument Again
-
-The integrity checks at each layer are not enough by themselves. Ethernet checksums detect bit-flips in transit, but not on disk. Disk checksums detect bit-flips on disk, but not bugs in software. Software unit tests catch some bugs, but not all. The only way to catch corruption across all layers is to do **end-to-end integrity checks**: verify that the data flowing through the entire pipeline is consistent, from the moment it enters the system to the moment it is consumed.
-
-This is most cleanly expressed in event-based systems. If every state change is captured in an immutable event log, and every derived state is computed by deterministic functions of the log, then end-to-end integrity means: re-derive everything from scratch, and check that the result matches the live state. If they agree, the system is intact. If they differ, corruption has occurred somewhere along the way.
-
-This kind of check is expensive to run continuously, but it can be run as a periodic background job, or sampled. The higher the stakes of the data, the more often the check should run.
-
 ---
 
 ## 8. Summary
 
-This chapter has been philosophical rather than algorithmic. We have looked at how to compose specialized tools into a coherent system, how to keep that system correct in the face of faults, and how to verify that it remains correct over time.
+This chapter has been philosophical rather than algorithmic. We have looked at how to compose specialized tools into a coherent system, how to keep that system correct in the face of faults, and how to verify that it remains correct over time. The three pillars — data integration, correctness, and verifiability — all rest on the same substrate: an immutable, append-only event log from which everything else is derived.
 
 ```mermaid
 graph TB
@@ -1627,25 +1238,17 @@ graph TB
     style SYSTEM fill:#FFB6C1
 ```
 
-### Key takeaways
+### Key Takeaways
 
 1. **No single tool does everything.** Compose specialized tools, but make the composition principled.
-
 2. **The event log is the central abstraction.** It is the substrate for derived data, the channel for cross-system consistency, and the audit trail for verifiability.
-
 3. **Derived data is asynchronous.** By default, derived systems are eventually consistent. If you need stronger guarantees, add them explicitly (synchronous writes for hot paths, end-to-end request IDs for cross-system operations).
-
 4. **Uniqueness and similar constraints require consensus.** Shard by the conflict key, and process each shard sequentially. This generalizes the single-DB unique constraint to a stream-based system.
-
 5. **End-to-end arguments apply.** Low-level guarantees (TCP duplicate suppression, DB transactions, exactly-once stream processing) are useful but not sufficient. Application-level deduplication, with request IDs that travel through every layer, is what actually prevents double-processing.
-
 6. **Decouple timeliness from integrity.** Integrity (no corruption) matters more than timeliness (no staleness). Event-based systems preserve integrity by default; add timeliness only where needed.
-
 7. **Audit continuously.** Don't trust your own infrastructure blindly. Use hash-chained logs, Merkle trees, and periodic reprocessing to detect corruption.
 
-8. **Loose coupling pays off.** Asynchronous, log-based integration makes the system more robust to faults and easier for multiple teams to evolve independently.
-
-### What we did not cover
+### What We Did Not Cover
 
 - **Detailed performance tuning** of stream processors and CDC pipelines.
 - **Specific tool recommendations** (Debezium, Kafka, Flink, Materialize, etc.) beyond illustrative mentions.
@@ -1655,9 +1258,7 @@ graph TB
 
 These are real engineering problems, but they are downstream of the philosophy described here. Once you have decided to treat the event log as the substrate of your system, the rest is implementation.
 
----
-
-## Further Reading
+### Further Reading
 
 - Jay Kreps, "The Log: What Every Software Engineer Should Know About Real-Time Data's Unifying Abstraction" (2013).
 - Martin Kleppmann and Jay Kreps, "Kafka, Samza and the Unix Philosophy of Distributed Data" (2015).

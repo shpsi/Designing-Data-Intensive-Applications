@@ -1,10 +1,18 @@
 # Chapter 7: Sharding
 
+## TL;DR
+
+- Sharding splits a large dataset across multiple machines (shards). It's a heavyweight solution for problems a single machine can no longer handle — typically very large data volumes, very high write throughput, or both.
+- Two main partitioning strategies: by **key range** (good for range queries, risk of hot spots) and by **hash of key** (good for even distribution, breaks range-query efficiency). Hash-based partitioning uses **consistent hashing** (see also Ch6 §4) to minimize data movement when nodes are added or removed.
+- A good sharding scheme distributes data and load evenly across shards. **Skew** (uneven distribution) creates hot spots that the scheme itself cannot fix — you need application-level techniques like random-key suffixes or virtual buckets to relieve them.
+- Sharding interacts badly with secondary indexes and with cross-shard transactions. Indexes can be **local** (fast writes, scatter/gather reads) or **global** (fast reads, expensive multi-shard writes). Cross-shard writes typically need distributed transactions (Ch8).
+- Rebalancing can be fully automatic, fully manual, or require human approval of an automated plan. The middle ground is often safest — unattended rebalancing combined with failure detection can cause cascading failures.
+
 ## Introduction
 
-In Chapter 5, we discussed replication - keeping copies of the same data on multiple machines for redundancy and performance. But what if your dataset is so large that it doesn't fit on a single machine? Or what if a single machine cannot handle all the read and write requests?
+In Chapter 6, we discussed replication — keeping copies of the same data on multiple machines for redundancy and performance. But what if your dataset is so large that it doesn't fit on a single machine? Or what if a single machine cannot handle all the read and write requests?
 
-This is where **sharding** comes in. Sharding is the technique of breaking up a large database into smaller pieces, called **shards** (sometimes called partitions, regions, vnodes, vBuckets, tablets, or ranges, depending on the database), and distributing them across multiple machines. In the 1st edition of this book, this was called *partitioning*; the 2nd edition uses the term *sharding* to match industry convention.
+This is where **sharding** comes in. Sharding is the technique of breaking up a large database into smaller pieces, called **shards**, and distributing them across multiple machines. In the 1st edition of this book, this was called *partitioning*; the 2nd edition uses the term *sharding* to match industry convention.
 
 ```mermaid
 graph TB
@@ -26,33 +34,68 @@ graph TB
     style S4 fill:#87CEEB
 ```
 
-**Sharding vs. partitioning terminology**: Different systems give this concept different names. Kafka calls it a *partition*, HBase and TiDB call it a *region*, CockroachDB calls it a *range*, Cassandra calls it a *token-range*, Couchbase calls it a *vBucket*, Riak calls it a *vnode*, and Bigtable, YugabyteDB, and ScyllaDB call it a *tablet*. In PostgreSQL, partitioning historically meant splitting a large table into several files on the *same* machine (which makes operations like bulk delete very fast), whereas sharding splits a dataset across *multiple* machines. In most other systems, the two terms are interchangeable.
-
-Note that "partitioning" has nothing to do with *network partitions* (netsplits) - we will discuss that kind of fault in Chapter 9.
+Different systems give this concept different names. Kafka calls it a *partition*, HBase and TiDB call it a *region*, CockroachDB calls it a *range*, Cassandra calls it a *token-range*, Couchbase calls it a *vBucket*, Riak calls it a *vnode*, and Bigtable, YugabyteDB, and ScyllaDB call it a *tablet*. In PostgreSQL, partitioning historically meant splitting a large table into several files on the *same* machine (which makes operations like bulk delete very fast), whereas sharding splits a dataset across *multiple* machines. In most other systems, the two terms are interchangeable. Note that "partitioning" has nothing to do with *network partitions* (netsplits) — we will discuss that kind of fault in Chapter 9.
 
 ### Why Shard Data?
 
-Sharding becomes necessary when data grows beyond what a single machine can handle. The main reasons are:
+Sharding is a heavyweight solution that is mostly relevant at large scale. If your data volume and write throughput are such that a single machine can handle them (and a single machine can do a lot nowadays!), it's often better to avoid sharding and stick with a single-shard database.
 
-1. **Scalability - Handle more data**
-   - Single machine has limited disk capacity (maybe 1-10TB)
-   - With sharding, dataset can grow to petabytes by adding more machines
-   - Example: Facebook has petabytes of user data, impossible to store on one machine
+The primary reason for sharding a database is **scalability** — the ability to grow capacity by adding more (smaller) machines rather than moving to a bigger machine. This is **horizontal scaling** (a scale-out architecture). If you can divide the workload such that each shard handles a roughly equal share, you can assign those shards to different machines to process their data and queries in parallel.
 
-2. **Performance - Handle more requests**
-   - Single machine has limited CPU and memory
-   - Query throughput limited by single machine (e.g., 10,000 queries/second)
-   - With sharding, queries distributed across many machines
-   - If you have 10 shards, theoretically 10x throughput
-   - Example: Twitter handles millions of tweets/second by sharding across thousands of machines
+```mermaid
+graph TB
+    subgraph "Vertical Scaling (Scale Up)"
+        V1["Add more RAM<br/>Add more CPU<br/>Add bigger disks"]
+        V2[(One Big Machine)]
+        V1 --> V2
+        style V2 fill:#ffcccc
+    end
 
-3. **Parallel query processing**
-   - Large queries can be parallelized across multiple shards
-   - Each shard processes its subset of data independently
-   - Results combined at the end
-   - Example: Analytics query "count users by country" - each shard counts its users, results aggregated
+    subgraph "Horizontal Scaling (Scale Out)"
+        H1["Add more machines<br/>Each handles a shard"]
+        H2[(Machine 1)]
+        H3[(Machine 2)]
+        H4[(Machine 3)]
+        H5[(Machine 4)]
+        H1 --> H2
+        H1 --> H3
+        H1 --> H4
+        H1 --> H5
+        style H2 fill:#90EE90
+        style H3 fill:#90EE90
+        style H4 fill:#90EE90
+        style H5 fill:#90EE90
+    end
+```
+
+Sharding becomes necessary when:
+
+1. **Scalability — Handle more data**: Single machine has limited disk capacity (1-10TB). With sharding, dataset can grow to petabytes by adding more machines. Example: Facebook has petabytes of user data, impossible to store on one machine.
+
+2. **Performance — Handle more requests**: Single machine has limited CPU and memory. Query throughput is bounded by one machine. With sharding, queries are distributed across many machines — if you have 10 shards, theoretically 10x throughput. Example: Twitter handles millions of tweets/second by sharding across thousands of machines.
+
+3. **Parallel query processing**: Large queries can be parallelized across multiple shards. Each shard processes its subset of data independently, and results are combined at the end. Example: an analytics query like "count users by country" runs a local count on each shard, and the results are aggregated.
 
 **The goal of sharding**: Spread data and query load evenly across multiple machines. If sharding is unfair (one shard has more data/queries than others), we call it **skewed**. A shard with disproportionately high load is called a **hot shard** or **hot spot**. If one particular key is hot, we call it a **hot key**.
+
+The reason for this recommendation is that sharding adds significant complexity. You typically have to decide which records to put in which shard by choosing a **partition key** (or shard key); all records with the same partition key are placed in the same shard. This choice matters because accessing a record is fast if you know which shard it's in, but if you don't, you have to do an inefficient search across all shards. The sharding scheme is also difficult to change.
+
+Some systems even use sharding on a single machine — for example, Redis, VoltDB, and FoundationDB run one process per CPU core and rely on sharding to spread load across cores in the same machine, sometimes to take advantage of non-uniform memory access (NUMA) architectures where some banks of memory are closer to one CPU than to others.
+
+### Drawbacks of Sharding
+
+| Aspect | Single-shard DB | Sharded DB |
+|--------|----------------|------------|
+| Operational complexity | Simple | Complex |
+| Schema migrations | Easy | Need to coordinate across shards |
+| Cross-shard queries | N/A | Slow (scatter/gather) |
+| Cross-shard transactions | N/A | Slow (distributed transactions) |
+| Index design | Trivial | Local vs. global decision |
+| Re-sharding | Trivial | Expensive |
+
+Sharding often works well for **key-value data**, where you can easily shard by key, but it's harder with **relational data**, where you may want to search by a secondary index or join records that might be distributed across different shards. We will discuss this further in "Sharding and Secondary Indexes" later in this chapter.
+
+Another problem with sharding is that a write may need to update related records in several shards. While transactions on a single node are quite common, ensuring consistency across multiple shards requires a **distributed transaction**. As we will see in Chapter 8, distributed transactions are available in some databases, but they are usually much slower than single-node transactions and may become a bottleneck for the system as a whole.
 
 ### Sharding vs. Replication
 
@@ -96,76 +139,11 @@ graph TB
     style S1F2 fill:#87CEEB
 ```
 
-**Example**: A database with 4 shards, each replicated 3x (3 replicas per shard) = 12 nodes total. Each node acts as leader for some shards and follower for others.
+A database with 4 shards, each replicated 3x (3 replicas per shard) = 12 nodes total. Each node acts as leader for some shards and follower for others. Everything about replication from Chapter 6 applies equally to the replication of shards. Since the choice of sharding scheme is mostly independent of the choice of replication scheme, we will ignore replication in this chapter for the sake of simplicity.
 
-Everything about replication from Chapter 5 applies equally to the replication of shards. Since the choice of sharding scheme is mostly independent of the choice of replication scheme, we will ignore replication in this chapter for the sake of simplicity.
+### Sharding for Multitenancy
 
-### When NOT to Shard
-
-While replication is useful at both small and large scale, because it enables fault tolerance and offline operation, **sharding is a heavyweight solution that is mostly relevant at large scale**. If your data volume and write throughput are such that a single machine can handle them (and a single machine can do a lot nowadays!), it's often better to avoid sharding and stick with a single-shard database.
-
-The reason for this recommendation is that sharding adds complexity. You typically have to decide which records to put in which shard by choosing a **partition key** (or shard key); all records with the same partition key are placed in the same shard. This choice matters because accessing a record is fast if you know which shard it's in, but if you don't, you have to do an inefficient search across all shards. The sharding scheme is also difficult to change.
-
-Some systems even use sharding on a single machine - for example, Redis, VoltDB, and FoundationDB run one process per CPU core and rely on sharding to spread load across cores in the same machine, sometimes to take advantage of non-uniform memory access (NUMA) architectures where some banks of memory are closer to one CPU than to others.
-
----
-
-## Pros and Cons of Sharding
-
-The primary reason for sharding a database is **scalability**. Sharding is a solution if the volume of data or the write throughput has become too great for a single node to handle, as it allows you to spread that data and those writes across multiple nodes. (If read throughput is the problem, you don't necessarily need sharding - you can use read scaling, as discussed in Chapter 5.)
-
-Sharding is one of the main tools we have for achieving **horizontal scaling** (a scale-out architecture) - that is, allowing a system to grow its capacity not by moving to a bigger machine, but by adding more (smaller) machines. If you can divide the workload such that each shard handles a roughly equal share, you can then assign those shards to different machines to process their data and queries in parallel.
-
-```mermaid
-graph TB
-    subgraph "Vertical Scaling (Scale Up)"
-        V1["Add more RAM<br/>Add more CPU<br/>Add bigger disks"]
-        V2[(One Big Machine)]
-        V1 --> V2
-        style V2 fill:#ffcccc
-    end
-
-    subgraph "Horizontal Scaling (Scale Out)"
-        H1["Add more machines<br/>Each handles a shard"]
-        H2[(Machine 1)]
-        H3[(Machine 2)]
-        H4[(Machine 3)]
-        H5[(Machine 4)]
-        H1 --> H2
-        H1 --> H3
-        H1 --> H4
-        H1 --> H5
-        style H2 fill:#90EE90
-        style H3 fill:#90EE90
-        style H4 fill:#90EE90
-        style H5 fill:#90EE90
-    end
-```
-
-### Drawbacks of Sharding
-
-Sharding adds significant complexity:
-
-| Aspect | Single-shard DB | Sharded DB |
-|--------|----------------|------------|
-| Operational complexity | Simple | Complex |
-| Schema migrations | Easy | Need to coordinate across shards |
-| Cross-shard queries | N/A | Slow (scatter/gather) |
-| Cross-shard transactions | N/A | Slow (distributed transactions) |
-| Index design | Trivial | Local vs. global decision |
-| Re-sharding | Trivial | Expensive |
-
-Sharding often works well for **key-value data**, where you can easily shard by key, but it's harder with **relational data**, where you may want to search by a secondary index or join records that might be distributed across different shards. We will discuss this further in "Sharding and Secondary Indexes" later in this chapter.
-
-Another problem with sharding is that a write may need to update related records in several shards. While transactions on a single node are quite common, ensuring consistency across multiple shards requires a **distributed transaction**. As we will see in Chapter 8, distributed transactions are available in some databases, but they are usually much slower than single-node transactions and may become a bottleneck for the system as a whole.
-
----
-
-## Sharding for Multitenancy
-
-Software as a service (SaaS) products and cloud services are often multitenant, where each tenant is a customer. Multiple users may have logins on the same tenant, but each tenant has a self-contained dataset that is separate from those of other tenants. For example, in an email marketing service, each business that signs up is typically a separate tenant, since one business's newsletter sign-ups, delivery data, etc., are separate from those of other businesses.
-
-Sometimes sharding is used to implement multitenant systems. Either each tenant is given a separate shard, or multiple small tenants may be grouped together into a larger shard. These shards might be physically separate databases (which we previously touched on in "Embedded Storage Engines") or separately manageable portions of a larger logical database.
+Software as a service (SaaS) products and cloud services are often multitenant, where each tenant is a customer. Multiple users may have logins on the same tenant, but each tenant has a self-contained dataset that is separate from those of other tenants. Sometimes sharding is used to implement multitenant systems — either each tenant is given a separate shard, or multiple small tenants may be grouped together into a larger shard. These shards might be physically separate databases or separately manageable portions of a larger logical database.
 
 ```mermaid
 graph TB
@@ -190,72 +168,18 @@ graph TB
     style T5 fill:#FFB6C1
 ```
 
-### Advantages of Sharding for Multitenancy
+Key advantages:
 
-Using sharding for multitenancy has several advantages:
+- **Isolation (resource, permission, fault)**: If one tenant performs an expensive operation, other tenants are less likely to be affected. If access control has a bug, cross-tenant data leakage is less likely. In a cell-based architecture, the services and storage for a particular set of tenants are grouped into a self-contained cell, and different cells run largely independently — so a fault in one cell stays limited to that cell, providing **fault isolation**.
+- **Per-tenant backup and restore**: Backing up each tenant's shard separately makes it possible to restore a tenant's state from a backup without affecting other tenants, which is useful if the tenant accidentally deletes or overwrites important data.
+- **Regulatory compliance and data residency**: Privacy regulations such as the GDPR and CCPA give individuals the right to access and request deletion of personal information. If each person's data is stored in a separate shard, this translates into simple data export and deletion operations on their shard. Region-aware databases also let you assign a tenant's shard to a particular jurisdiction to satisfy data residency laws.
+- **Gradual schema rollout**: Schema migrations can be rolled out gradually, one tenant at a time. This reduces risk, as you can detect problems before they affect all tenants, but it can be difficult to do transactionally.
 
-**1. Resource isolation**
+Main challenges:
 
-If one tenant performs a computationally expensive operation, it is less likely that other tenants' performance will be affected if they are running on different shards.
-
-**2. Permission isolation**
-
-If there is a bug in your access control logic, it's less likely that you will accidentally give one tenant access to another tenant's data if those tenants' datasets are stored physically separately from each other.
-
-**3. Cell-based architecture**
-
-You can apply sharding not only at the data storage level, but also for the services running your application code. In a cell-based architecture, the services and storage for a particular set of tenants are grouped into a self-contained cell, and different cells are set up such that they can run largely independently from each other. This approach provides **fault isolation**: a fault in one cell remains limited to that cell, and tenants in other cells are not affected.
-
-```mermaid
-graph LR
-    subgraph "Cell A"
-        CA1[App Servers]
-        CA2[Database Shard A]
-    end
-    subgraph "Cell B"
-        CB1[App Servers]
-        CB2[Database Shard B]
-    end
-    subgraph "Cell C"
-        CC1[App Servers]
-        CC2[Database Shard C]
-    end
-
-    Fault[Fault in Cell B] -.->|Isolated| CB1
-    Fault -.->|Does not affect| CA1
-    Fault -.->|Does not affect| CC1
-
-    style Fault fill:#FFA500
-    style CB1 fill:#ffcccc
-    style CA1 fill:#90EE90
-    style CC1 fill:#90EE90
-```
-
-**4. Per-tenant backup and restore**
-
-Backing up each tenant's shard separately makes it possible to restore a tenant's state from a backup without affecting other tenants, which can be useful if the tenant accidentally deletes or overwrites important data.
-
-**5. Regulatory compliance**
-
-Data privacy regulations such as the GDPR and CCPA give individuals the right to access and request deletion of personal information that businesses store about them. If each person's data is stored in a separate shard, this translates into simple data export and deletion operations on their shard.
-
-**6. Data residence**
-
-If a particular tenant's data needs to be stored in a particular jurisdiction to comply with data residency laws, a region-aware database can allow you to assign that tenant's shard to a particular region.
-
-**7. Gradual schema rollout**
-
-Schema migrations can be rolled out gradually, one tenant at a time. This reduces risk, as you can detect problems before they affect all tenants, but it can be difficult to do transactionally.
-
-### Challenges of Multitenancy Sharding
-
-The main challenges around using sharding for multitenancy are as follows:
-
-- It assumes that each individual tenant is small enough to fit on a single node. If that is not the case, and you have a single tenant that's too big for one machine, you will need to additionally perform sharding *within* that tenant, which brings us back to the topic of sharding for scalability.
-
-- If you have many small tenants, creating a separate shard for each one may incur too much overhead. You could group several small tenants together into a bigger shard, but then you have the problem of how you move tenants from one shard to another as they grow.
-
-- If you ever need to support features that connect data across multiple tenants, these become harder to implement if you need to join data across multiple shards.
+- Assumes each individual tenant is small enough to fit on a single node; otherwise you need sharding *within* that tenant, which brings us back to scalability.
+- Many small tenants create overhead if each gets its own shard. Grouping small tenants into a bigger shard creates complexity when tenants grow and need to be moved.
+- Cross-tenant features become harder if data must be joined across multiple shards.
 
 ---
 
@@ -263,7 +187,7 @@ The main challenges around using sharding for multitenancy are as follows:
 
 Say you have a large amount of data, and you want to shard it. How do you decide which records to store on which nodes?
 
-The goal with sharding is to spread the data and the query load evenly across nodes. If every node takes a fair share, then - in theory - 10 nodes should be able to handle 10 times as much data and 10 times the read and write throughput of a single node (ignoring replication). If you add or remove a node, you also want to be able to rebalance the load so that it is evenly distributed across the new number of nodes.
+The goal with sharding is to spread the data and the query load evenly across nodes. If every node takes a fair share, then — in theory — 10 nodes should be able to handle 10 times as much data and 10 times the read and write throughput of a single node (ignoring replication). If you add or remove a node, you also want to be able to rebalance the load so that it is evenly distributed across the new number of nodes.
 
 If the sharding is unfair, so that some shards have more data or queries than others, we call it **skewed**. The presence of skew makes sharding much less effective. In an extreme case, all the load could end up on one shard, so 9 out of 10 nodes are idle, and your bottleneck is the single busy node.
 
@@ -334,7 +258,7 @@ For example, consider an application that stores data from a network of sensors,
 
 ### Hot Spot Risk
 
-A downside of key-range sharding is that you can easily get a hot shard if there are a lot of writes to nearby keys. For example, if the key is a timestamp, then the shards correspond to ranges of time - for example, one shard per month. If you write data from the sensors to the database as the measurements happen, all the writes will end up going to the same shard (the one for this month), so that shard will be overloaded with writes while others sit idle.
+A downside of key-range sharding is that you can easily get a hot shard if there are a lot of writes to nearby keys. For example, if the key is a timestamp, then the shards correspond to ranges of time — for example, one shard per month. If you write data from the sensors to the database as the measurements happen, all the writes will end up going to the same shard (the one for this month), so that shard will be overloaded with writes while others sit idle.
 
 ```mermaid
 graph TB
@@ -494,87 +418,13 @@ results = db.shards[0].range_scan(
 
 ## Sharding by Hash of Key
 
-Key-range sharding is useful if you want records with nearby (but different) partition keys to be grouped into the same shard - for example, this might be the case with timestamps. If you don't care whether partition keys are near each other (e.g., if they are tenant IDs in a multitenant application), a common approach is to first **hash the partition key** before mapping it to a shard.
+Key-range sharding is useful if you want records with nearby (but different) partition keys to be grouped into the same shard — for example, this might be the case with timestamps. If you don't care whether partition keys are near each other (e.g., if they are tenant IDs in a multitenant application), a common approach is to first **hash the partition key** before mapping it to a shard.
 
 A good hash function takes skewed data and makes it uniformly distributed. Say you have a 32-bit hash function that takes a string. Whenever you give it a new string, it returns a seemingly random number from 0 to 2^32 − 1. Even if the input strings are very similar, their hashes are evenly distributed across that range of numbers (but the same input always produces the same output).
 
 For sharding purposes, the hash function need not be cryptographically strong: for example, **MongoDB uses MD5**, whereas **Cassandra and ScyllaDB use Murmur3**.
 
 Many programming languages have simple hash functions built in (as they are used for hash tables), but they may not be suitable for sharding: for example, in Java's `Object.hashCode()` and Ruby's `Object#hash`, the same key may have a different hash value in different processes, making them unsuitable for sharding.
-
-```mermaid
-graph TB
-    subgraph "Input Keys"
-        K1[Alice]
-        K2[Bob]
-        K3[Charlie]
-        K4[David]
-        K5[Eve]
-    end
-
-    subgraph "Hash Function"
-        H["Hash Function<br/>e.g., MD5, Murmur3"]
-    end
-
-    subgraph "Modulo Operation"
-        M["hash(key) mod num_shards"]
-    end
-
-    subgraph "Shards"
-        P0[(Shard 0<br/>Bob, ...)]
-        P1[(Shard 1<br/>David, ...)]
-        P2[(Shard 2<br/>Alice, ...)]
-        P3[(Shard 3<br/>Charlie, Eve, ...)]
-    end
-
-    K1 --> H
-    K2 --> H
-    K3 --> H
-    K4 --> H
-    K5 --> H
-
-    H --> M
-    M --> P0
-    M --> P1
-    M --> P2
-    M --> P3
-
-    style P0 fill:#87CEEB
-    style P1 fill:#87CEEB
-    style P2 fill:#87CEEB
-    style P3 fill:#87CEEB
-```
-
-### Hash Modulo Number of Nodes
-
-Once you have hashed the key, how do you choose which shard to store it in? Your first thought may be to take the hash value modulo the number of nodes in the system (using the `%` operator in many programming languages). For example, `hash(key) % 10` would return a number from 0 to 9 (if we write the hash as a decimal number, `hash % 10` would be the last digit). If we have 10 nodes, numbered 0 to 9, that seems like an easy way of assigning each key to a node.
-
-The problem with the `mod N` approach is that if the number of nodes N changes, most of the keys have to be moved from one node to another.
-
-```mermaid
-graph LR
-    subgraph "3 Nodes"
-        N0[Node 0<br/>Keys: 0,3,6,9]
-        N1[Node 1<br/>Keys: 1,4,7]
-        N2[Node 2<br/>Keys: 2,5,8]
-    end
-
-    subgraph "After Adding Node 3"
-        N0B["Node 0<br/>Keys: 0,9<br/>(3,6 moved)"]
-        N1B["Node 1<br/>Keys: 1,4,7<br/>✓ Same"]
-        N2B["Node 2<br/>Keys: 2,5,8<br/>✓ Same"]
-        N3B["Node 3<br/>Keys: 3,6<br/>(new)"]
-    end
-
-    N0 -.->|"Many keys<br/>move!"| N0B
-    N1 -.-> N1B
-    N2 -.-> N2B
-
-    style N0B fill:#ffcccc
-    style N3B fill:#90EE90
-```
-
-The `mod N` function is easy to compute, but it leads to very inefficient rebalancing because there is a lot of unnecessary movement of records from one node to another. We need an approach that moves as little data as possible.
 
 ### Fixed Number of Shards
 
@@ -605,59 +455,32 @@ graph TB
     style N5B fill:#90EE90
 ```
 
-Now, if a node is added to the cluster, the system can reassign some of the shards from existing nodes to the new node until they are fairly distributed once again. If a node is removed from the cluster, the same happens in reverse.
+The simpler `mod N` approach (`hash(key) % N` directly against the current node count) leads to inefficient rebalancing because if N changes, most keys must move. With the fixed-shards approach, when a node is added to the cluster, the system can reassign some of the shards from existing nodes to the new node until they are fairly distributed once again. If a node is removed, the same happens in reverse.
 
-In this model, only entire shards are moved between nodes, which is cheaper than splitting shards. The number of shards does not change, nor does the assignment of keys to shards. The only thing that changes is the assignment of shards to nodes. This reassignment is not immediate - it takes some time to transfer a large amount of data over the network - so the old assignment of shards is used for any reads and writes that happen while the transfer is in progress.
+In this model, only entire shards are moved between nodes, which is cheaper than splitting shards. The number of shards does not change, nor does the assignment of keys to shards. The only thing that changes is the assignment of shards to nodes. This reassignment is not immediate — it takes some time to transfer a large amount of data over the network — so the old assignment of shards is used for any reads and writes that happen while the transfer is in progress.
 
-It's common to choose the number of shards to be one that is divisible by many factors, so that the dataset can be evenly split across various numbers of nodes - not requiring the number of nodes to be a power of 2, for example. You can even account for mismatched hardware in your cluster: by assigning more shards to nodes that are more powerful, you can make those nodes take on a greater share of the load.
+It's common to choose the number of shards to be one that is divisible by many factors, so that the dataset can be evenly split across various numbers of nodes — not requiring the number of nodes to be a power of 2, for example. You can even account for mismatched hardware in your cluster: by assigning more shards to nodes that are more powerful, you can make those nodes take on a greater share of the load.
 
 This approach to sharding is used in **Citus** (a sharding layer for PostgreSQL), **Riak**, **Elasticsearch**, and **Couchbase**, among others. It works well as long as you have a good estimate of how many shards you will need when you first create the database. You can then add or remove nodes easily, subject to the limitation that you can't have more nodes than you have shards.
 
-If you find the originally configured number of shards to be wrong - for example, if you have reached a scale where you need more nodes than you have shards - then an expensive resharding operation is required. It needs to split each shard and write it out to new files, using a lot of additional disk space in the process. Some systems don't allow resharding while concurrently writing to the database, which makes it difficult to change the number of shards without downtime.
+If you find the originally configured number of shards to be wrong — for example, if you have reached a scale where you need more nodes than you have shards — then an expensive resharding operation is required. It needs to split each shard and write it out to new files, using a lot of additional disk space in the process. Some systems don't allow resharding while concurrently writing to the database, which makes it difficult to change the number of shards without downtime.
 
 Choosing the right number of shards is difficult if the total size of the dataset is highly variable (e.g., if it starts small but may grow much larger over time). Since each shard contains a fixed fraction of the total data, the size of each shard grows proportionally to the total amount of data in the cluster. If shards are very large, rebalancing and recovery from node failures become expensive. But if shards are too small, they incur too much overhead. The best performance is achieved when the size of shards is "just right," neither too big nor too small, which can be hard to achieve if the number of shards is fixed but the dataset size varies.
 
-### Sharding by Hash Range
+### Consistent Hashing
+
+A **consistent hashing** algorithm maps keys to a specified number of shards in a way that satisfies two properties:
+
+- The number of keys mapped to each shard is roughly equal.
+- When the number of shards changes, as few keys as possible are moved from one shard to another.
+
+Note that "consistent" here has nothing to do with *replica consistency* (see Chapter 6) or *ACID consistency* (see Chapter 8), but rather describes the tendency of a key to stay in the same shard if possible. The original definition of consistent hashing comes from work on distributed hash tables; Chapter 6 §4 also discusses sharding-by-hash and rebalancing. The next subsection merges the related "sharding by hash range" idea so this chapter has one canonical treatment.
 
 If the required number of shards can't be predicted in advance, it's better to use a scheme in which the number of shards can adapt easily to the workload. The aforementioned key-range sharding scheme has this property, but it has a risk of hot spots when there are a lot of writes to nearby keys. One solution is to combine key-range sharding with a hash function so that each shard contains a **range of hash values** rather than a range of keys.
 
-```mermaid
-graph TB
-    subgraph "Hash Function (16-bit)"
-        H1["Hash 'alice' = 12345"]
-        H2["Hash 'bob' = 56789"]
-        H3["Hash 'carol' = 100"]
-        H4["Hash 'dave' = 60000"]
-    end
+Using a 16-bit hash function that returns a number from 0 to 65,535 = 2^16 − 1 (in reality, the hash is usually 32 bits or more), even input keys that are very similar (e.g., consecutive timestamps) have uniformly distributed hashes. We then assign a range of hash values to each shard — for example, values from 0 to 16,383 to shard 0, values from 16,384 to 32,767 to shard 1, and so on.
 
-    subgraph "Shard 0 (0-16383)"
-        S0["Keys: carol, alice<br/>(hash 100, 12345)"]
-    end
-
-    subgraph "Shard 1 (16384-32767)"
-        S1["(empty in example)"]
-    end
-
-    subgraph "Shard 2 (32768-49151)"
-        S2["(empty in example)"]
-    end
-
-    subgraph "Shard 3 (49152-65535)"
-        S3["Keys: bob, dave<br/>(hash 56789, 60000)"]
-    end
-
-    H1 --> S0
-    H2 --> S3
-    H3 --> S0
-    H4 --> S3
-
-    style S0 fill:#87CEEB
-    style S3 fill:#87CEEB
-```
-
-In this example using a 16-bit hash function that returns a number from 0 to 65,535 = 2^16 − 1 (in reality, the hash is usually 32 bits or more). Even if the input keys are very similar (e.g., consecutive timestamps), their hashes are uniformly distributed across that range. We can then assign a range of hash values to each shard - for example, values from 0 to 16,383 to shard 0, values from 16,384 to 32,767 to shard 1, and so on.
-
-As with key-range sharding, in hash-range sharding a shard can be split when it becomes too big or too heavily loaded. This is still an expensive operation, but it can happen as needed, so the number of shards adapts to the volume of data rather than being fixed in advance.
+As with key-range sharding, a shard can be split when it becomes too big or too heavily loaded. This is still an expensive operation, but it can happen as needed, so the number of shards adapts to the volume of data rather than being fixed in advance.
 
 The downside compared to key-range sharding is that **range queries over the partition key are not efficient**, as keys in the range are now scattered across all the shards. However, if keys consist of two or more columns and the partition key is only the first of these columns, you can still perform efficient range queries over the second and later columns. As long as all records in the range query have the same partition key, they will be in the same shard.
 
@@ -665,39 +488,7 @@ The downside compared to key-range sharding is that **range queries over the par
 
 Data warehouses such as **BigQuery**, **Snowflake**, and **Delta Lake** support a similar indexing approach, though the terminology differs. In BigQuery, for example, the partition key determines which partition a record resides in, while "cluster columns" determine how records are sorted within the partition. Snowflake assigns records to "micro-partitions" automatically but allows users to define cluster keys for a table. Delta Lake supports both manual and automatic partition assignment and supports cluster keys. Clustering data not only improves range scan performance, but can improve compression and filtering performance as well.
 
-**YugabyteDB** and **DynamoDB** use hash-range sharding, and it is an option in **MongoDB**. **Cassandra** and **ScyllaDB** use a variant of this approach.
-
-```mermaid
-graph TB
-    subgraph "Hash Space 0-1024"
-        H1[Range 0-340<br/>Node 1]
-        H2[Range 341-680<br/>Node 2]
-        H3[Range 681-1024<br/>Node 3]
-    end
-
-    subgraph "Cassandra/ScyllaDB Approach"
-        C1["Node 1: ranges 0-100,<br/>200-250, 300-340<br/>(3 ranges per node)"]
-        C2["Node 2: ranges 341-450,<br/>500-580, 650-680"]
-        C3["Node 3: ranges 681-790,<br/>850-920, 980-1024"]
-    end
-
-    style C1 fill:#87CEEB
-    style C2 fill:#87CEEB
-    style C3 fill:#87CEEB
-```
-
-In Cassandra and ScyllaDB, the space of hash values is split into a number of ranges proportional to the number of nodes (3 ranges per node in the figure, but actual numbers are 16 per node in Cassandra by default, and 256 per node in ScyllaDB), with random boundaries between those ranges. This means some ranges are bigger than others, but by having multiple ranges per node, those imbalances tend to even out.
-
-When nodes are added or removed, range boundaries are adjusted and shards are split or merged accordingly. When node 3 is added, node 1 transfers parts of two of its ranges to node 3, and node 2 transfers part of one of its ranges to node 3. This has the effect of giving the new node an approximately fair share of the dataset, without transferring more data than necessary from one node to another.
-
-### Consistent Hashing
-
-A **consistent hashing** algorithm is a hash function that maps keys to a specified number of shards in a way that satisfies two properties:
-
-- The number of keys mapped to each shard is roughly equal.
-- When the number of shards changes, as few keys as possible are moved from one shard to another.
-
-Note that "consistent" here has nothing to do with *replica consistency* (see Chapter 5) or *ACID consistency* (see Chapter 8), but rather describes the tendency of a key to stay in the same shard if possible.
+**YugabyteDB** and **DynamoDB** use hash-range sharding, and it is an option in **MongoDB**. **Cassandra** and **ScyllaDB** use a variant of this approach: the space of hash values is split into a number of ranges proportional to the number of nodes (16 per node in Cassandra by default, 256 per node in ScyllaDB), with random boundaries between those ranges. This means some ranges are bigger than others, but by having multiple ranges per node, those imbalances tend to even out. When nodes are added or removed, range boundaries are adjusted and shards are split or merged accordingly. When node 3 is added, node 1 transfers parts of two of its ranges to node 3, and node 2 transfers part of one of its ranges to node 3. This has the effect of giving the new node an approximately fair share of the dataset, without transferring more data than necessary from one node to another.
 
 The sharding algorithm used by Cassandra and ScyllaDB is similar to the original definition of consistent hashing, but several other consistent hashing algorithms have also been proposed, such as *highest random weight* (also known as *rendezvous hashing*), and *jump consistent hashing*. With these approaches, rather than a small number of existing shards being split into subranges to create new shards for a node that is added, the new node is instead assigned individual keys that were previously scattered across all the other nodes. Which is preferable depends on the application.
 
@@ -832,7 +623,7 @@ In this implementation, each physical shard gets many "virtual nodes" scattered 
 
 ## Skewed Workloads and Relieving Hot Spots
 
-Consistent hashing ensures that keys are uniformly distributed across nodes, but that doesn't mean that the actual load is uniformly distributed. **If the workload is highly skewed** - that is, there is much more data under some partition keys than others, or the rate of requests to some keys is much higher than to others - you can still end up with some servers being overloaded while others sit almost idle.
+Consistent hashing ensures that keys are uniformly distributed across nodes, but that doesn't mean that the actual load is uniformly distributed. **If the workload is highly skewed** — that is, there is much more data under some partition keys than others, or the rate of requests to some keys is much higher than to others — you can still end up with some servers being overloaded while others sit almost idle.
 
 For example, on a social media site, a post by a celebrity user with millions of followers may cause a storm of activity. This event can result in a large volume of reads and writes to the same key (where the partition key is perhaps the user ID of the celebrity, or the ID of the action that people are commenting on).
 
@@ -981,7 +772,7 @@ Some systems (especially cloud services designed for large scale) have automated
 
 We have glossed over one important question with regard to rebalancing: **does the splitting of shards and rebalancing happen automatically or manually?**
 
-Some systems automatically decide when to split shards and when to move them from one node to another, without any human interaction, while others leave sharding to be explicitly configured by an administrator. There is also a middle ground - for example, **Couchbase and Riak** generate a suggested shard assignment automatically but require an administrator to commit it before it takes effect.
+Some systems automatically decide when to split shards and when to move them from one node to another, without any human interaction, while others leave sharding to be explicitly configured by an administrator. There is also a middle ground — for example, **Couchbase and Riak** generate a suggested shard assignment automatically but require an administrator to commit it before it takes effect.
 
 ```mermaid
 graph TB
@@ -1046,13 +837,13 @@ For that reason, it can be good to have a human in the loop for rebalancing. It'
 
 ### Best Practice
 
-The middle ground - generate the rebalancing plan automatically but require human approval before executing - is often the best compromise.
+The middle ground — generate the rebalancing plan automatically but require human approval before executing — is often the best compromise.
 
 ---
 
 ## Request Routing
 
-We have discussed how to shard a dataset across multiple nodes, and how to rebalance those shards as nodes are added or removed. Now let's move on to another question: if you want to read or write a particular key, **how do you know which node** - that is, which IP address and port number - you need to connect to?
+We have discussed how to shard a dataset across multiple nodes, and how to rebalance those shards as nodes are added or removed. Now let's move on to another question: if you want to read or write a particular key, **how do you know which node** — that is, which IP address and port number — you need to connect to?
 
 We call this problem **request routing**, and it's very similar to service discovery. The biggest difference between the two is that with services running application code, each instance is usually stateless, and a load balancer can send a request to any of the instances. With sharded databases, a request for a key can be handled only by a node that is a replica for the shard containing that key.
 
@@ -1269,7 +1060,7 @@ Key-value stores often don't have secondary indexes, but they are a standard fea
 
 ### Local Secondary Indexes
 
-In the first indexing approach, each shard independently maintains its own secondary indexes, covering only the records in that shard. It doesn't care what data is stored in other shards. Whenever you write to the database - to add, remove, or update a record - you need to deal with only the shard containing the record that you are writing. For that reason, this type of secondary index is known as a **local index**. In an information retrieval context, it's also known as a **document-partitioned index**.
+In the first indexing approach, each shard independently maintains its own secondary indexes, covering only the records in that shard. It doesn't care what data is stored in other shards. Whenever you write to the database — to add, remove, or update a record — you need to deal with only the shard containing the record that you are writing. For that reason, this type of secondary index is known as a **local index**. In an information retrieval context, it's also known as a **document-partitioned index**.
 
 ```mermaid
 graph TB
@@ -1323,7 +1114,7 @@ sequenceDiagram
     Note over Client: Combine results from all shards
 ```
 
-This approach to querying a sharded database can make read queries on secondary indexes quite expensive. Even if you query the shards in parallel, it is prone to **tail latency amplification** - if one shard is slow, the entire query waits. It also limits the scalability of your application: adding more shards lets you store more data, but it doesn't increase your query throughput if every shard has to process every query anyway.
+This approach to querying a sharded database can make read queries on secondary indexes quite expensive. Even if you query the shards in parallel, it is prone to **tail latency amplification** — if one shard is slow, the entire query waits. It also limits the scalability of your application: adding more shards lets you store more data, but it doesn't increase your query throughput if every shard has to process every query anyway.
 
 ```python
 class Shard:
@@ -1605,46 +1396,13 @@ In this chapter we explored different ways of sharding a large dataset into smal
 
 The goal of sharding is to spread the data and query load evenly across multiple machines, avoiding hot spots (nodes with disproportionately high load). This requires choosing a sharding scheme that is appropriate to your data, and rebalancing the shards when nodes are added to or removed from the cluster.
 
-```mermaid
-graph TB
-    Goal[Sharding Goal:<br/>Spread data and load evenly]
-    Goal --> Method
-    Method[Sharding Method]
-    Method --> KeyRange[Key Range]
-    Method --> Hash[Hash]
-
-    KeyRange --> RangePros["+ Range queries efficient<br/>+ Sorted within shard"]
-    KeyRange --> RangeCons["- Hot spots on writes<br/>- Splits expensive"]
-
-    Hash --> HashPros["+ Even distribution<br/>+ Simple to reason about"]
-    Hash --> HashCons["- Range queries broken<br/>- Hash mod N is fragile"]
-
-    Hash --> Consistent[Consistent Hashing]
-    Consistent --> ConsistentPros["+ Minimal data movement<br/>+ Used in production"]
-    Consistent --> ConsistentCons["- Slightly more complex"]
-
-    style Goal fill:#FFD700
-    style Method fill:#87CEEB
-    style KeyRange fill:#90EE90
-    style Hash fill:#90EE90
-    style Consistent fill:#DDA0DD
-```
-
 ### Key Sharding Approaches
 
 We discussed two main approaches to sharding:
 
-**Key range sharding**
+**Key range sharding.** Keys are sorted, and a shard owns all the keys from a minimum up to a maximum. Sorting has the advantage that efficient range queries are possible, but there is a risk of hot spots if the application often accesses keys that are close together in the sorted order. Shards are typically rebalanced by splitting the range into two subranges when a shard gets too big.
 
-Keys are sorted, and a shard owns all the keys from a minimum up to a maximum. Sorting has the advantage that efficient range queries are possible, but there is a risk of hot spots if the application often accesses keys that are close together in the sorted order.
-
-In this approach, shards are typically rebalanced by splitting the range into two subranges when a shard gets too big.
-
-**Hash sharding**
-
-A hash function is applied to each key, and a shard owns a range of hash values (or another consistent hashing algorithm may be used to map hashes to shards). This method destroys the ordering of keys, making range queries inefficient, but it may distribute load more evenly.
-
-When sharding by hash, it is common to create a fixed number of shards in advance, to assign several shards to each node, and to move entire shards from one node to another when nodes are added or removed. Splitting shards, as with key ranges, is also possible.
+**Hash sharding.** A hash function is applied to each key, and a shard owns a range of hash values (or another consistent hashing algorithm may be used to map hashes to shards). This method destroys the ordering of keys, making range queries inefficient, but it may distribute load more evenly. When sharding by hash, it is common to create a fixed number of shards in advance, to assign several shards to each node, and to move entire shards from one node to another when nodes are added or removed. Splitting shards, as with key ranges, is also possible.
 
 It's common to use the first part of the key as the partition key (i.e., to identify the shard) and to sort records within that shard by the rest of the key. That way, you can still have efficient range queries among the records with the same partition key.
 
@@ -1652,82 +1410,16 @@ It's common to use the first part of the key as the partition key (i.e., to iden
 
 We also discussed techniques for routing queries to the appropriate shard, and we looked at how a coordination service is often used to keep track of the assignment of shards to nodes.
 
-```mermaid
-graph LR
-    Topic[Chapter 7 Topics] --> Pros[Pros and Cons]
-    Topic --> Multi[Multitenancy]
-    Topic --> KV[Key-Value Methods]
-    Topic --> Hot[Hot Spot Mitigation]
-    Topic --> Rebal[Rebalancing]
-    Topic --> Route[Request Routing]
-    Topic --> Idx[Secondary Indexes]
-
-    Pros --> Scal[Scalability<br/>but more complexity]
-    Multi --> Iso[Resource and<br/>permission isolation]
-    KV --> Range[Key Range]
-    KV --> Hash["Hash<br/>(with consistent hashing)"]
-    Hot --> Suf[Random suffix technique]
-    Rebal --> Auto[Automatic]
-    Rebal --> Manual[Manual]
-    Rebal --> Mid[Semi-automatic]
-    Route --> Any[Any-node forwarding]
-    Route --> Tier[Routing tier]
-    Route --> Client[Client-aware]
-    Idx --> Local[Local indexes]
-    Idx --> Global[Global indexes]
-
-    style Topic fill:#FFD700
-    style Scal fill:#90EE90
-    style Iso fill:#90EE90
-    style Range fill:#87CEEB
-    style Hash fill:#87CEEB
-    style Suf fill:#FFA500
-    style Auto fill:#DDA0DD
-    style Manual fill:#DDA0DD
-    style Mid fill:#DDA0DD
-    style Any fill:#ffeb3b
-    style Tier fill:#ffeb3b
-    style Client fill:#ffeb3b
-    style Local fill:#FFB6C1
-    style Global fill:#FFB6C1
-```
-
 ### Secondary Indexes
 
 Finally, we considered the interaction between sharding and secondary indexes. A secondary index needs to be sharded too. There are two methods for this:
 
-**Local secondary indexes**
+**Local secondary indexes.** The secondary indexes are stored in the same shard as the primary key and value. Only a single shard needs to be updated on write, but a lookup of the secondary index requires reading from all shards.
 
-The secondary indexes are stored in the same shard as the primary key and value. Only a single shard needs to be updated on write, but a lookup of the secondary index requires reading from all shards.
-
-**Global secondary indexes**
-
-The secondary indexes are sharded separately based on the indexed values. An entry in the secondary index may refer to records from all shards of the primary key. When a record is written, several secondary index shards may need to be updated; however, a read of the postings list can be served from a single shard (fetching the actual records still requires reading from multiple shards).
+**Global secondary indexes.** The secondary indexes are sharded separately based on the indexed values. An entry in the secondary index may refer to records from all shards of the primary key. When a record is written, several secondary index shards may need to be updated; however, a read of the postings list can be served from a single shard (fetching the actual records still requires reading from multiple shards).
 
 ### Looking Ahead
 
-By design, every shard operates mostly independently - that's what allows a sharded database to scale to multiple machines. However, operations that need to write to several shards can be problematic - for example, what happens if the write to one shard succeeds, but another fails? We will address that question in the following chapter on transactions.
+By design, every shard operates mostly independently — that's what allows a sharded database to scale to multiple machines. However, operations that need to write to several shards can be problematic — for example, what happens if the write to one shard succeeds, but another fails? We will address that question in the following chapter on transactions.
 
-### Sharding at a Glance
-
-| Database | Sharding Method | Rebalancing | Routing |
-|----------|----------------|-------------|---------|
-| Cassandra | Hash (consistent) | Proportional to nodes | Gossip, any-node |
-| MongoDB | Hash (default) or range | Dynamic or pre-split | Routing tier (mongos) |
-| HBase | Range | Dynamic (auto-split) | ZooKeeper |
-| Riak | Hash (consistent) | Fixed or proportional | Gossip, any-node |
-| DynamoDB | Hash | Dynamic | Client + routing service |
-| Elasticsearch | Hash | Fixed (can't change) | Any-node |
-| CockroachDB | Range (auto-split) | Dynamic | Routing tier |
-| YugabyteDB | Hash-range | Dynamic | Raft consensus |
-| ScyllaDB | Hash (with vnodes) | Proportional | Gossip |
-
-Sharding is a powerful technique, but it adds complexity. The right strategy depends on your:
-- Data size and growth rate
-- Query patterns (point queries vs. range queries)
-- Consistency requirements
-- Operational complexity tolerance
-
-When in doubt, start with a single-shard database (with replication for fault tolerance) and only add sharding when the data volume or write throughput genuinely demands it. As the book notes: "If your data volume and write throughput are such that a single machine can handle them (and a single machine can do a lot nowadays!), it's often better to avoid sharding and stick with a single-shard database."
-
-Next chapter will discuss transactions - maintaining correctness guarantees even in the face of sharding, replication, and failures.
+Sharding is a powerful technique, but it adds complexity. The right strategy depends on your data size and growth rate, query patterns (point queries vs. range queries), consistency requirements, and operational complexity tolerance. When in doubt, start with a single-shard database (with replication for fault tolerance) and only add sharding when the data volume or write throughput genuinely demands it. As the book notes: "If your data volume and write throughput are such that a single machine can handle them (and a single machine can do a lot nowadays!), it's often better to avoid sharding and stick with a single-shard database."

@@ -1,5 +1,15 @@
 # Chapter 6: Replication
 
+## TL;DR
+
+- Replication keeps a copy of the same data on multiple machines (nodes) connected via a network; it underpins scale, fault tolerance, and low latency in nearly every distributed database, broker, and storage system.
+- Three principal strategies: **single-leader** (one leader accepts writes, forwards a stream to followers), **multi-leader** (each region/device accepts writes, peers replicate to one another), **leaderless** (any replica accepts writes; clients/coordinators use quorum reads and writes).
+- Replication can be **synchronous or asynchronous**; the choice governs how much lag is tolerable, what is lost on failover, and how strongly the replicas can be made to agree.
+- Replication lag introduces anomalies — **read-your-writes**, **monotonic reads**, **consistent prefix reads** — that are mitigated by routing reads, sticking users to one replica, or moving to strongly consistent databases (the **NewSQL** approach).
+- Multi-leader and leaderless replication must **detect concurrent writes** (e.g., with version numbers or version vectors) and **resolve conflicts** (LWW, CRDTs, OT, manual resolution, or sibling merge).
+
+---
+
 ## Introduction
 
 Replication means keeping a copy of the same data on multiple machines (nodes) connected via a network. It is one of the most fundamental patterns in distributed systems: nearly every serious database, message broker, or storage system uses it in some form to achieve scale, fault tolerance, and low latency.
@@ -108,7 +118,12 @@ Normally replication is quite fast — most database systems apply changes to fo
 
 #### Advantages and Disadvantages
 
-The advantage of synchronous replication is that the follower is guaranteed to have an up-to-date copy of the data consistent with the leader's. If the leader suddenly fails, we can be sure that the data is still available on the follower. The disadvantage is that if the synchronous follower doesn't respond (because it has crashed, or because there is a network fault, or for any other reason), the write cannot be processed — the leader must block all writes and wait until the synchronous replica is available again.
+| Aspect | Synchronous | Asynchronous |
+|---|---|---|
+| Follower up-to-date? | Guaranteed at the moment of ACK | Lag; may fall arbitrarily behind |
+| Durability if leader fails | Strong (data on follower) | Risk of losing recent un-replicated writes |
+| Write availability | Blocked if the synchronous follower is unavailable | Leader keeps processing writes |
+| Typical configuration | One sync follower + others async (semisynchronous); or quorum of sync replicas | All followers async |
 
 For that reason it is impracticable for all followers to be synchronous; any one node outage would cause the whole system to grind to a halt. In practice, if a database offers synchronous replication, it often means that **one of the followers is synchronous and the others are asynchronous**. If the synchronous follower becomes unavailable or slow, one of the asynchronous followers is made synchronous. This guarantees that you have an up-to-date copy of the data on at least two nodes: the leader and one synchronous follower. This configuration is sometimes called **semisynchronous**.
 
@@ -159,7 +174,7 @@ Object storage can be used for more than archiving data. Many databases are begi
 
 - **Cheap storage tier**: object storage is inexpensive compared to other cloud storage options. This allows cloud databases to store data that's queried less often on cheaper, higher-latency storage while serving the working set from memory, SSDs, and NVMe.
 - **Multi-region replication built in**: object stores provide multi-zone, dual-region, or multi-region replication with very high durability guarantees. This also allows databases to bypass inter-zone network fees.
-- **Conditional writes for transactions and leader election**: databases can use an object store's conditional write feature — essentially a compare-and-set (CAS) operation — to implement transactions and leadership election [10, 11].
+- **Conditional writes for transactions and leader election**: databases can use an object store's conditional write feature — a compare-and-set (CAS) operation — to implement transactions and leadership election [10, 11].
 - **Simplified data integration**: storing data from multiple databases in the same object store can simplify data integration, particularly when open formats such as Parquet and Iceberg are used.
 
 These benefits dramatically simplify the database architecture by shifting the responsibility of transactions, leadership election, and replication to object storage.
@@ -233,16 +248,16 @@ sequenceDiagram
 
 Failover is fraught with things that can go wrong:
 
-- **If asynchronous replication is used**, the new leader may not have received all the writes from the old leader before it failed. If the former leader rejoins the cluster after a new leader has been chosen, what should happen to those writes? The new leader may have received conflicting writes in the meantime. The most common solution is for the old leader's unreplicated writes to simply be discarded, which means that writes you believed to be committed weren't durable after all.
+- **If asynchronous replication is used**, the new leader may not have received all the writes from the old leader before it failed. If the former leader rejoins the cluster after a new leader has been chosen, what should happen to those writes? The new leader may have received conflicting writes in the meantime. The most common solution is for the old leader's unreplicated writes to be discarded, which means that writes you believed to be committed weren't durable after all.
 - **Discarding writes is especially dangerous** if other storage systems outside of the database need to be coordinated with the database contents. **Example: the 2012 GitHub incident [14]** — an out-of-date MySQL follower was promoted to leader. The database used an autoincrementing counter to assign primary keys to new rows, but because the new leader's counter lagged behind the old leader's, it reused some primary keys that had previously been assigned by the old leader. These primary keys were also used in a Redis store, so the reuse of primary keys resulted in inconsistency between MySQL and Redis, which caused some private data to be disclosed to the wrong users.
 - **In certain fault scenarios (see Chapter 9)**, two nodes could both believe that they are the leader. This situation, called **split brain**, is dangerous; if both leaders accept writes, and there is no process for resolving conflicts, data is likely to be lost or corrupted. As a safety catch, some systems have a mechanism to shut down one node if two leaders are detected. However, if this mechanism is not carefully designed, you can end up with both nodes being shut down [15]. Moreover, there is a risk that by the time the split brain is detected and the old node is shut down, it is already too late and data has already been corrupted.
 - **Deciding on the right timeout** before the leader is declared dead can be tricky. A longer timeout means a longer time to recovery in the case where the leader fails. However, if the timeout is too short, unnecessary failovers could occur. For example, a temporary load spike could cause a node's response time to increase above the timeout, or a network glitch could cause delayed packets. If the system is already struggling with high load or network problems, an unnecessary failover is likely to make the situation worse, not better.
 
-Guarding against split brain by limiting or shutting down old leaders is known as **fencing**; we discuss it in more detail in Chapter 9 (Distributed Locks and Leases). However, these problems have no easy solutions. For this reason, some operations teams prefer to perform failovers manually, even if the software supports automatic failover.
+Guarding against split brain by limiting or shutting down old leaders is known as **fencing**; see Chapter 10 (Fencing Tokens) for the canonical treatment. These problems have no easy solutions. For this reason, some operations teams prefer to perform failovers manually, even if the software supports automatic failover.
 
 The most important thing with failover is to pick an up-to-date follower as the new leader. If synchronous or semisynchronous replication is used, this would be the follower that the old leader waited for before acknowledging writes. With asynchronous replication, you can pick the follower with the highest log sequence number. This minimizes the amount of data that is lost during failover; losing a fraction of a second's worth of writes may be tolerable, but picking a follower that is behind by several days could be catastrophic.
 
-These issues — node failures, unreliable networks, and trade-offs around replica consistency, durability, availability, and latency — are in fact fundamental problems in distributed systems. In Chapters 9 and 10 we will discuss them in greater depth.
+These issues — node failures, unreliable networks, and trade-offs around replica consistency, durability, availability, and latency — are fundamental problems in distributed systems. In Chapters 9 and 10 we will discuss them in greater depth.
 
 ### 1.5 Implementation of Replication Logs
 
@@ -256,7 +271,7 @@ Although this approach to replication may sound reasonable, it can break down in
 
 - Any statement that calls a nondeterministic function, such as NOW to get the current date and time or RAND to get a random number, is likely to generate a different value on each replica.
 - If statements use an autoincrementing column, or if they depend on the existing data in the database (e.g., UPDATE ... WHERE some-condition), they must be executed in exactly the same order on each replica, or else they may have a different effect. This can be limiting when there are multiple concurrently executing transactions.
-- Statements that have side effects (e.g., triggers, stored procedures, user-defined functions) may result in different side effects occurring on each replica, unless the side effects are absolutely deterministic.
+- Statements that have side effects (e.g., triggers, stored procedures, user-defined functions) may result in different side effects occurring on each replica, unless the side effects are deterministic.
 
 It is possible to work around those issues — for example, the leader can replace any nondeterministic function calls with a fixed return value when the statement is logged so that the followers all get the same value. The idea of executing deterministic statements in a fixed order is similar to the **event sourcing** model discussed in Chapter 4 and to **state machine replication**, which we will revisit in Chapter 10.
 
@@ -290,13 +305,7 @@ That may seem like a minor implementation detail, but it can have a big operatio
 
 An alternative is to use different log formats for replication and for the storage engine, which allows the replication log to be decoupled from the storage engine internals. This kind of replication log is called a **logical log**, to distinguish it from the storage engine's (physical) data representation.
 
-A logical log for a relational database is usually a sequence of records describing writes to database tables at the granularity of a row:
-
-- For an inserted row, the log contains the new values of all columns.
-- For a deleted row, the log contains enough information to uniquely identify the row that was deleted. Typically this would be the primary key, but if there is no primary key on the table, the old values of all columns need to be logged.
-- For an updated row, the log contains enough information to uniquely identify the updated row, and the new values of all columns (or at least all columns whose values have changed).
-
-A transaction that modifies several rows generates several such log records, followed by a record indicating that the transaction was committed. When configured to use row-based replication, MySQL keeps a separate logical replication log, called the **binlog**, in addition to the WAL. PostgreSQL implements logical replication by decoding the physical WAL into row insertion/update/delete events [19].
+A logical log for a relational database is a sequence of records describing row-level inserts, deletes, and updates (with sufficient identifiers to disambiguate each row), followed by a record indicating that the transaction was committed. When configured to use row-based replication, MySQL keeps a separate logical replication log, called the **binlog**, in addition to the WAL. PostgreSQL implements logical replication by decoding the physical WAL into row insertion/update/delete events [19].
 
 Since a logical log is decoupled from the storage engine internals, it can more easily be kept backward compatible, allowing the leader and the follower to run different versions of the database software. This in turn enables upgrading to a new version with minimal downtime [20].
 
@@ -514,17 +523,14 @@ One solution is to make sure that any writes that are causally related to each o
 
 ### 2.4 Solutions for Replication Lag
 
-When working with an eventually consistent system, it is worth thinking about how the application behaves if the replication lag increases to several minutes or even hours. If the answer is "no problem," that's great. However, if the result is a bad experience for users, it's important to design the system to provide a stronger guarantee, such as read-after-write. Pretending that replication is synchronous when in fact it is asynchronous is a recipe for problems down the line.
+When working with an eventually consistent system, it is worth thinking about how the application behaves if the replication lag increases to several minutes or even hours. If the answer is "no problem," that's great. However, if the result is a bad experience for users, it's important to design the system to provide a stronger guarantee. Pretending that replication is synchronous when it is asynchronous is a recipe for problems down the line.
 
-As discussed earlier, there are ways for an application to provide a stronger guarantee than the underlying database — for example, by performing certain kinds of reads on the leader or a synchronously updated follower. However, dealing with these issues in application code is complex and easy to get wrong.
+- **Routing reads of recently-written data to the leader** (or a synchronously-updated follower) is the standard application-level mitigation — covered under "Implementation Techniques" in §2.1. Other guarantees — monotonic reads, consistent prefix reads — are achievable in similar ways. However, dealing with these issues in application code is complex and easy to get wrong.
+- **The simplest programming model** is to choose a database that provides strong consistency — linearizability (see Chapter 10) and ACID transactions (see Chapter 8) — so the application can treat the database as if it had just a single node. In the early 2010s, the NoSQL movement argued such features limited scalability, but since then, a wave of strongly consistent distributed databases has emerged. This trend is known as **NewSQL** (see Chapter 2). NewSQL offers strong consistency plus the fault tolerance, availability, and scalability of a distributed database.
 
-The simplest programming model for application developers is to choose a database that provides a strong consistency guarantee for replicas, such as **linearizability** (see Chapter 10), and supports ACID transactions (see Chapter 8). This allows you to mostly ignore the challenges that arise from replication and treat the database as if it had just a single node. In the early 2010s, the NoSQL movement promoted the view that these features limited scalability and that large-scale systems would have to embrace eventual consistency.
+Even though scalable, strongly consistent distributed databases are now available, there are still good reasons some applications choose weaker-consistency replication — chiefly, stronger resilience to network interruptions and lower overhead than transactional systems can offer. We will explore such approaches in the rest of this chapter.
 
-However, since then, a number of databases have started providing strong consistency and transaction support while also offering the fault tolerance, high availability, and scalability advantages of a distributed database. As mentioned in Chapter 2, this trend is known as **NewSQL** to contrast with NoSQL (although it's less about SQL specifically and more about new approaches to scalable transaction management).
-
-Even though scalable, strongly consistent distributed databases are now available, there are still good reasons some applications choose to use different forms of replication that offer weaker consistency guarantees. Notably, they can offer stronger resilience in the face of network interruptions and have lower overheads compared to transactional systems. We will explore such approaches in the rest of this chapter.
-
-### Summary of Consistency Guarantees
+The consistency guarantees introduced in §2.1–§2.3 are summarized below for reference:
 
 | Guarantee | What it prevents | Strength |
 |---|---|---|
@@ -586,37 +592,11 @@ graph TB
 
 ### 3.1 Geographically Distributed Operation
 
-It rarely makes sense to use a multi-leader setup within a single region, because the benefits rarely outweigh the added complexity. However, in some situations this configuration is reasonable.
+It rarely makes sense to use a multi-leader setup within a single region, because the benefits rarely outweigh the added complexity. However, in some situations this configuration is reasonable — for example, when you need to tolerate the failure of an entire region, or when proximity with your users matters.
 
-Imagine you have a database with replicas in several regions (perhaps so that you can tolerate the failure of an entire region, or perhaps for proximity with your users). This is known as a **geographically distributed**, **geo-distributed**, or **geo-replicated** setup. With single-leader replication, the leader has to be in one of the regions, and all writes must go through that region.
+Imagine you have a database with replicas in several regions. This is known as a **geographically distributed**, **geo-distributed**, or **geo-replicated** setup. With single-leader replication, the leader has to be in one of the regions, and all writes must go through that region.
 
 In a multi-leader configuration, you can have a leader in each region. Within each region, regular leader–follower replication is used (with followers maybe in a different availability zone from the leader); between regions, each region's leader replicates its changes to the leaders in other regions.
-
-#### Performance
-
-In a single-leader configuration, every write must go over the internet to the region with the leader. This can add significant latency to writes and might defeat the purpose of having multiple regions in the first place. In a multi-leader configuration, every write can be processed in the local region and then replicated asynchronously to the other regions. Thus, the inter-region network delay is hidden from users, which means the perceived performance may be better.
-
-#### Tolerance of Regional Outages
-
-In a single-leader configuration, if the region with the leader becomes unavailable, failover can promote a follower in another region to be leader. In a multi-leader configuration, each region can continue operating independently of the others, and replication catches up when the offline region comes back online.
-
-#### Tolerance of Network Problems
-
-Even with dedicated connections, traffic between regions can be less reliable than traffic between zones in the same region or within a single zone. A single-leader configuration is very sensitive to problems in this inter-region link, because when a client in one region wants to write to a leader in another region, it has to send its request over that link and wait for the response before it can complete.
-
-A multi-leader configuration with asynchronous replication can tolerate network problems better; during a temporary network interruption, each region's leader can continue independently processing writes.
-
-#### Consistency
-
-A single-leader system can provide strong consistency guarantees, such as **serializable transactions**, which we will discuss in Chapter 8. The biggest downside of multi-leader systems is that the consistency they can achieve is much weaker. For example, you can't guarantee that a bank account won't go negative or that a username is unique; it's always possible for different leaders to process writes that are individually fine (paying out some of the money in an account, registering a particular username) but that violate the constraint when taken together with another write on another leader.
-
-This is simply a fundamental limitation of distributed systems [28]. If you need to enforce such constraints, you're therefore better off with a single-leader system. However, as we will see in section 3.4, multi-leader systems can still achieve consistency properties that are useful in a wide range of apps that don't need such constraints.
-
-Multi-leader replication is less common than single-leader replication, but it's still supported by many databases, including **MySQL, Oracle, SQL Server, and YugabyteDB**. In some cases it is an external add-on feature — for example, in **Redis Enterprise**, **EDB Postgres Distributed**, and **pglogical** [29].
-
-As multi-leader replication is a retrofitted feature in many databases, there are often subtle configuration pitfalls and surprising interactions with other database features. For example, **autoincrementing keys**, **triggers**, and **integrity constraints** can be problematic. For this reason, multi-leader replication is often considered dangerous territory that should be avoided if possible [30].
-
-#### Comparison Table
 
 | Aspect | Single-Leader | Multi-Leader |
 |---|---|---|
@@ -625,6 +605,12 @@ As multi-leader replication is a retrofitted feature in many databases, there ar
 | Datacenter failure tolerance | Failover needed (downtime) | Each datacenter continues independently |
 | Network partition tolerance | Inter-datacenter link failure stops writes | Each datacenter continues operating |
 | Conflict handling | No conflicts (single source of truth) | Must handle write conflicts |
+
+The trade-offs in the table above motivate multi-leader replication: lower write latency for remote users, continued operation through datacenter or network failures. The biggest downside is that consistency guarantees are weaker (e.g., no serializability across leaders) — see Chapter 8.
+
+Multi-leader replication is less common than single-leader replication, but it's still supported by many databases, including **MySQL, Oracle, SQL Server, and YugabyteDB**. In some cases it is an external add-on feature — for example, in **Redis Enterprise**, **EDB Postgres Distributed**, and **pglogical** [29].
+
+As multi-leader replication is a retrofitted feature in many databases, there are often subtle configuration pitfalls and surprising interactions with other database features. For example, **autoincrementing keys**, **triggers**, and **integrity constraints** can be problematic. For this reason, multi-leader replication is often considered dangerous territory that should be avoided if possible [30].
 
 ### 3.2 Multi-Leader Replication Topologies
 
@@ -771,7 +757,7 @@ In section 6 we will tackle the question of how a database can determine whether
 
 One strategy for dealing with conflicts is to prevent them from occurring in the first place. For example, if the application can ensure that all writes for a particular record go through the same leader, then conflicts cannot occur, even if the database as a whole is multi-leader. This approach is not possible for a sync engine client being updated offline, but it is sometimes possible in geo-replicated server systems [30].
 
-For example, in an application where a user can edit only their own data, you can ensure that requests from a particular user are always routed to the same region and use the leader in that region for reading and writing. Different users may have different "home" regions (perhaps picked based on geographic proximity to the user), but from any one user's point of view, the configuration is essentially single-leader.
+For example, in an application where a user can edit only their own data, you can ensure that requests from a particular user are always routed to the same region and use the leader in that region for reading and writing. Different users may have different "home" regions (perhaps picked based on geographic proximity to the user), but from any one user's point of view, the configuration is single-leader.
 
 However, sometimes you might want to change the designated leader for a record — perhaps because one region is unavailable and you need to reroute traffic to another region, or perhaps because a user has moved to a different location and is now closer to a different region. There is now a risk that the user performs a write while the change of designated leader is in progress, leading to a conflict that will have to be resolved using one of the following methods. Thus, conflict avoidance breaks down if you allow the leader to be changed.
 
@@ -781,7 +767,7 @@ For another example of conflict avoidance, imagine you want to insert new record
 
 If conflicts can't be avoided, the simplest way of resolving them is to attach a timestamp to each write and to always use the value with the most recent (greatest) timestamp. For example, let's say that the timestamp of user 1's write is greater than the timestamp of user 2's write. In that case, both leaders will determine that the new title of the page should be B, and they will discard the write that sets it to C. If the writes coincidentally have the same timestamp, the winner can be chosen by comparing the values (e.g., for strings, taking the one that's earlier in the alphabet).
 
-This approach is called **last write wins (LWW)** because the write with the greatest timestamp can be considered the "last" one. The term is misleading, though, because when two writes are concurrent, which one is most recent is undefined, so the timestamp order of concurrent writes is essentially random. Therefore, the real meaning of LWW is this: when the same record is concurrently written on different leaders, one of those writes is randomly chosen to be the winner and the other writes are silently discarded, even though they were successfully processed by their respective leaders. This achieves the goal that eventually all replicas end up in a consistent state, but at the cost of data loss.
+This approach is called **last write wins (LWW)** because the write with the greatest timestamp can be considered the "last" one. The term is misleading, though, because when two writes are concurrent, which one is most recent is undefined, so the timestamp order of concurrent writes is random. Therefore, the real meaning of LWW is this: when the same record is concurrently written on different leaders, one of those writes is randomly chosen to be the winner and the other writes are silently discarded, even though they were successfully processed by their respective leaders. This achieves the goal that eventually all replicas end up in a consistent state, but at the cost of data loss.
 
 If you can avoid conflicts — for example, by only inserting records with a unique key and never updating them — then LWW is no problem. But if you update existing records, or if different leaders may insert records with the same key, then you have to decide whether lost updates are a problem for your application. If lost updates are not acceptable, you need to use one of the conflict resolution approaches described next.
 
@@ -1223,13 +1209,13 @@ How do we decide whether two operations are concurrent? To develop an intuition,
 - In a multi-leader scenario where client A inserts a row and client B updates that row, the two writes are **not** concurrent: A's insert happens before B's update, because the value updated by B is the value inserted by A. In other words, B's operation builds upon A's operation, so B's operation must have happened later. We also say that B is **causally dependent** on A.
 - On the other hand, two writes that race on different replicas are concurrent: when each client starts the operation, it does not know that another client is also performing an operation on the same key. Thus, there is no causal dependency between the operations.
 
-An operation A **happens before** another operation B if B knows about A, or depends on A, or builds upon A in some way. Whether one operation happens before another operation is the key to defining what concurrency means. In fact, we can simply say that **two operations are concurrent if neither happens before the other** [58].
+An operation A **happens before** another operation B if B knows about A, or depends on A, or builds upon A in some way. Whether one operation happens before another operation is the key to defining what concurrency means. We can simply say that **two operations are concurrent if neither happens before the other** [58].
 
 Thus, whenever you have two operations A and B, there are three possibilities: either A happened before B, or B happened before A, or A and B are concurrent. What we need is an algorithm to tell us whether two operations are concurrent. If one operation happened before another, the later one should overwrite the earlier operation, but if the operations are concurrent, we have a conflict that needs to be resolved.
 
 #### Concurrency, Time, and Relativity
 
-It may seem that two operations should be called concurrent if they occur "at the same time" — but in fact, it is not important whether they literally overlap in time. Because of problems with clocks in distributed systems, it is actually quite difficult to tell whether two things happened at exactly the same time — an issue we will discuss in more detail in Chapter 9.
+It may seem that two operations should be called concurrent if they occur "at the same time" — but it is not important whether they literally overlap in time. Because of problems with clocks in distributed systems, it is quite difficult to tell whether two things happened at exactly the same time — an issue we will discuss in more detail in Chapter 9.
 
 For defining concurrency, exact time doesn't matter. We simply call two operations concurrent if they are both unaware of each other, regardless of the physical time at which they occurred. People sometimes make a connection between this principle and the special theory of relativity in physics [58], which introduced the idea that information cannot travel faster than the speed of light. Consequently, two events that occur some distance apart cannot possibly affect each other if the time between the events is shorter than the time it takes light to travel the distance between them.
 
@@ -1442,9 +1428,9 @@ graph LR
     A2 -.->|"concurrent"| C1
 
     style A1 fill:#90EE90
-    style B1 fill:#90EE90
-    style A2 fill:#90EE90
     style B2 fill:#90EE90
+    style A2 fill:#90EE90
+    style B1 fill:#90EE90
     style C1 fill:#90EE90
 ```
 
@@ -1452,66 +1438,18 @@ graph LR
 
 ## 6. Summary
 
-In this chapter we looked at the issue of replication. Replication can serve several purposes:
+Replication keeps a copy of the same data on multiple machines — a simple idea that turns into a remarkably tricky problem in practice.
 
-- **High availability**: keeping the system running, even when one machine (or several machines, a zone, or even an entire region) goes down
-- **Durability**: ensuring you don't lose data, even if a whole machine (or even an entire region) fails permanently
-- **Disconnected operation**: allowing an application to continue working despite a network interruption
-- **Latency**: placing data geographically close to users so that users can interact with it faster
-- **Scalability**: being able to handle a higher volume of reads than a single machine could handle, by performing reads on replicas
+### Why Replicate Data?
 
-Despite the concept being simple — keeping a copy of the same data on several machines — replication turns out to be a remarkably tricky problem. It requires carefully thinking about concurrency, all the things that can go wrong, and how to deal with the consequences of those faults. At a minimum, we need to deal with unavailable nodes and network interruptions (and that's not even considering the more insidious kinds of fault, such as silent data corruption due to software bugs or hardware errors).
+The five principal motivations for replication recur throughout the chapter:
 
-We discussed three main approaches to replication:
+- **High availability**: keeping the system running, even when one machine (or several machines, a zone, or even an entire region) goes down.
+- **Reduced latency / disaster recovery**: placing replicas geographically close to users and protecting against catastrophic failures.
+- **Increased read throughput**: distributing reads across followers to scale beyond the leader's capacity.
+- **Disconnected operation**: allowing an application to continue working despite a network interruption.
 
-- **Single-leader replication**: clients send all writes to a single node (the leader), which sends a stream of data change events to the other replicas (followers). Reads can be performed on any replica, but reads from followers might be stale.
-- **Multi-leader replication**: clients send each write to one of several leader nodes, any of which can accept writes. The leaders send streams of data change events to each other and to any follower nodes.
-- **Leaderless replication**: clients send each write to several nodes and read from several nodes in parallel in order to detect and correct nodes with stale data.
-
-Each approach has advantages and disadvantages. Single-leader replication is popular because it is fairly easy to understand and offers strong consistency. Multi-leader and leaderless replication can be more robust in the presence of faulty nodes, network interruptions, and latency spikes, at the cost of requiring conflict resolution and providing weaker consistency guarantees.
-
-Replication can be synchronous or asynchronous, which has a profound effect on the system behavior when there is a fault. Although asynchronous replication can be fast when the system is running smoothly, it's important to figure out what happens when replication lag increases and servers fail. If a leader fails and you promote an asynchronously updated follower to be the new leader, recently committed data may be lost.
-
-We looked at some strange effects that can be caused by replication lag, and we discussed a few consistency models that are helpful for deciding how an application should behave under replication lag:
-
-- **Read-after-write consistency**: users should always see data that they submitted themselves.
-- **Monotonic reads**: after users have seen the data at one point in time, they shouldn't later see the data from an earlier point in time.
-- **Consistent prefix reads**: users should see the data in a state that makes causal sense — for example, seeing a question and its reply in the correct order.
-
-Finally, we discussed how multi-leader and leaderless replication ensure that all replicas eventually converge to a consistent state: by using a version vector or similar algorithm to detect which writes are concurrent, and by using a conflict resolution algorithm such as a CRDT to merge the concurrently written values. LWW and manual conflict resolution are also possible.
-
-```mermaid
-graph TB
-    subgraph "Single-Leader"
-        SL_W["Writes to Leader"]
-        SL_R["Reads from Leader or Follower"]
-        SL_C["Conflicts: rare, only during failover"]
-    end
-
-    subgraph "Multi-Leader"
-        ML_W["Writes to any Leader"]
-        ML_R["Reads from any Replica"]
-        ML_C["Conflicts: common, needs resolution"]
-    end
-
-    subgraph "Leaderless"
-        LL_W["Writes to quorum w of n"]
-        LL_R["Reads from quorum r of n"]
-        LL_C["Conflicts: common, needs resolution"]
-    end
-
-    style SL_W fill:#87CEEB
-    style SL_R fill:#87CEEB
-    style SL_C fill:#90EE90
-    style ML_W fill:#87CEEB
-    style ML_R fill:#87CEEB
-    style ML_C fill:#ffcc99
-    style LL_W fill:#87CEEB
-    style LL_R fill:#87CEEB
-    style LL_C fill:#ffcc99
-```
-
-### Replication Strategy Comparison
+### Three Replication Strategies
 
 | Replication Type | Write Target | Read Source | Conflicts | Best For |
 |---|---|---|---|---|
@@ -1519,7 +1457,27 @@ graph TB
 | **Multi-Leader** | Any leader | Any replica | Common, needs resolution | Multi-datacenter, offline clients |
 | **Leaderless** | Any replica (quorum) | Multiple replicas (quorum) | Common, needs resolution | High availability, fault tolerance |
 
-### Key Takeaways
+Each approach has advantages and disadvantages. Single-leader replication is popular because it is fairly easy to understand and offers strong consistency. Multi-leader and leaderless replication can be more robust in the presence of faulty nodes, network interruptions, and latency spikes, at the cost of requiring conflict resolution and providing weaker consistency guarantees.
+
+### Sync vs Async
+
+Replication can be synchronous or asynchronous, which has a profound effect on the system behavior when there is a fault. Although asynchronous replication can be fast when the system is running smoothly, it's important to figure out what happens when replication lag increases and servers fail. If a leader fails and you promote an asynchronously updated follower to be the new leader, recently committed data may be lost.
+
+### Consistency Under Lag
+
+Lag-induced anomalies are mitigated by three standard guarantees:
+
+- **Read-after-write consistency**: users should always see data that they submitted themselves.
+- **Monotonic reads**: after users have seen the data at one point in time, they shouldn't later see the data from an earlier point in time.
+- **Consistent prefix reads**: users should see the data in a state that makes causal sense — for example, seeing a question and its reply in the correct order.
+
+The simplest programming model — and the dominant trend since the early 2010s — is to choose a database that provides strong consistency for replicas (linearizability; see Chapter 10) and ACID transactions (see Chapter 8). This approach, known as **NewSQL** (see Chapter 2), allows the application to treat the database as a single node.
+
+### Conflict Resolution
+
+Multi-leader and leaderless replication ensure that all replicas eventually converge to a consistent state by using a version vector or similar algorithm to detect concurrent writes, and by using a conflict resolution algorithm such as a CRDT to merge the concurrently written values. LWW and manual conflict resolution are also possible. Sync engines and local-first software (see §3.3) push the trade-off toward offline usability and instant UI response, at the cost of having to implement conflict resolution.
+
+### Closing
 
 - Replication provides redundancy, but introduces complexity. The basic idea is simple; the practice is not.
 - Asynchronous replication causes **lag** and consistency issues. Read-after-write, monotonic reads, and consistent prefix reads are the standard ways to reason about (and mitigate) that lag.

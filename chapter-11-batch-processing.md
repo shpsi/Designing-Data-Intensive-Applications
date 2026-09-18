@@ -1,5 +1,13 @@
 # Chapter 11: Batch Processing
 
+## TL;DR
+
+- Batch processing trades low latency for high throughput by treating inputs as immutable and avoiding side effects, which makes jobs reproducible and rerunnable.
+- A single-machine Unix pipeline (`cat | awk | sort | uniq | sort | head`) scales to terabytes via disk-based sorting — the same sorting trick that powers distributed batch frameworks.
+- Distributed batch systems compose three layers: a storage layer (HDFS or an object store), an orchestration layer (YARN, Kubernetes, Airflow), and a computation layer (MapReduce, Spark, Flink).
+- The shuffle algorithm — partitioning by key hash, sorting within partition, then merging across reducers — is the foundation for joins and aggregations across dataflow engines.
+- Major batch use cases are ETL into data warehouses, OLAP analytics, machine learning (feature engineering, training, inference), and serving derived data through streams or bulk loads.
+
 ## Introduction
 
 A **batch processing system** takes a large input, runs a job to process it, and produces some output. Batch jobs typically run for minutes, hours, or even days. They are measured by **throughput** (how much data they process per unit time), not by response time.
@@ -46,12 +54,10 @@ The simplest setting for batch processing is a single machine. Let's start with 
 
 ### Simple Log Analysis
 
-A typical NGINX access log line looks like this (one line, wrapped here for readability):
+A typical NGINX access log line looks like this:
 
 ```
-216.58.210.78 - - [27/Jun/2025:17:55:11 +0000] "GET /css/typography.css HTTP/1.1"
-200 3377 "https://martin.kleppmann.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X
-10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+216.58.210.78 - - [27/Jun/2025:17:55:11 +0000] "GET /css/typography.css HTTP/1.1" 200 3377 "https://martin.kleppmann.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 ```
 
 The NGINX default format is: `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"`. The seventh whitespace-separated field is the requested URL.
@@ -84,22 +90,6 @@ The output looks like:
 2124 /2020/11/18/distributed-systems-and-elliptic-curves.html
 1369 /
 915 /css/typography.css
-```
-
-```mermaid
-graph LR
-    subgraph "Log File"
-        LOG["access.log:<br/>216.58.210.78 ... GET /css/typography.css<br/>... GET /home<br/>... GET /home<br/>... GET /about<br/>... GET /home"]
-    end
-
-    subgraph "Desired Output"
-        OUT["4189 /favicon.ico<br/>3631 /2016/02/08/...<br/>2124 /2020/11/18/...<br/>1369 /<br/>915 /css/typography.css"]
-    end
-
-    LOG -->|"Unix pipeline"| OUT
-
-    style LOG fill:#87CEEB
-    style OUT fill:#90EE90
 ```
 
 ```mermaid
@@ -149,7 +139,7 @@ The Python script keeps a **hash table** in memory with one counter per distinct
 Which is better? It depends on the number of distinct keys:
 
 - For most small to mid-sized websites, all distinct URLs and their counters fit in 1 GB of memory. The working set depends on the number of distinct URLs, not on the number of requests. A million log entries for a single URL still use only one slot in the hash table. An in-memory hash table works fine, even on a laptop.
-- If the working set is larger than memory, sorting wins. The trick is the same one used by log-structured storage engines (see Chapter 4): sort chunks of data in memory, write them as sorted segment files, then merge those segments into a larger sorted file. Mergesort has sequential access patterns that perform well on disks.
+- If the working set is larger than memory, sorting wins. Sort chunks of data in memory, write them as sorted segment files, then merge those segments into a larger sorted file. Mergesort has sequential access patterns that perform well on disks.
 
 ```mermaid
 graph TB
@@ -537,72 +527,40 @@ graph TB
     style U fill:#90EE90
 ```
 
-#### Code Example: Simple Word Count in MapReduce Style
+#### Code Example: Sort-Merge Join
 
-The following Python code simulates a MapReduce word count job on a single machine. It demonstrates the four-phase pattern of MapReduce: input parsing, mapping, shuffling/sorting by key, and reducing.
+The following Python snippet shows how a reducer reads sorted inputs and produces a joined record. The sort-merge join algorithm relies on the shuffle to bring all values for one key together, with the dimension-table record (profile) appearing first because of a secondary sort.
 
 ```python
-from collections import defaultdict
-from typing import Iterator, Iterable, Tuple
-
-
-def mapper(record: str) -> Iterator[Tuple[str, int]]:
-    """Map phase: extract (word, 1) pairs from each record."""
-    for word in record.split():
-        # Normalize and skip very short tokens
-        w = word.strip(".,!?;:()[]\"'").lower()
-        if len(w) > 1:
-            yield (w, 1)
-
-
-def shuffle(pairs: Iterable[Tuple[str, int]]) -> Iterator[Tuple[str, list]]:
+def reduce_side_join(key, values):
     """
-    Shuffle/sort phase: group all values for the same key.
-    In real MapReduce this happens across machines; here we use a dict.
+    Sort-merge join: reducer sees records for one key,
+    with the profile (if present) appearing first.
     """
-    grouped = defaultdict(list)
-    for key, value in pairs:
-        grouped[key].append(value)
-    # Iteration in sorted order approximates the MapReduce sort step
-    for key in sorted(grouped):
-        yield key, grouped[key]
+    profile = None
+    activities = []
 
+    for tag, record in values:
+        if tag == 'profile':
+            profile = record
+        else:  # tag == 'activity'
+            activities.append(record)
 
-def reducer(key: str, values: list) -> Tuple[str, int]:
-    """Reduce phase: combine the values for a single key."""
-    return key, sum(values)
+    if profile is None:
+        # No profile for this user; skip
+        return
 
-
-def word_count(records: Iterable[str]) -> dict:
-    """Drive the full MapReduce pipeline."""
-    mapped = (pair for record in records for pair in mapper(record))
-    shuffled = shuffle(mapped)
-    return {k: v for k, v in (reducer(k, vs) for k, vs in shuffled)}
-
-
-# Example: count words in a tiny corpus
-if __name__ == "__main__":
-    documents = [
-        "MapReduce is simple but powerful",
-        "Spark is faster than MapReduce",
-        "Dataflow engines generalize MapReduce",
-    ]
-    counts = word_count(documents)
-    for word, count in sorted(counts.items(), key=lambda kv: -kv[1])[:5]:
-        print(f"{count} {word}")
+    for activity in activities:
+        yield {
+            'user_id': key,
+            'name':    profile['name'],
+            'dob':     profile['dob'],
+            'page':    activity['page'],
+            'time':    activity['time'],
+        }
 ```
 
-Output:
-
-```
-1 simple
-1 but
-1 powerful
-1 generalize
-1 engines
-```
-
-The real distributed MapReduce framework would replace the in-memory `defaultdict` in the `shuffle` function with a network-based partition-and-sort scheme, and the mapper and reducer callbacks would be invoked by the framework across many machines in parallel.
+The Unix pipeline and the MapReduce word-count pattern (mapper emits `(word, 1)` pairs, reducer sums counts) cover the same shape: extract keys, group by key, aggregate. Real distributed MapReduce replaces the in-memory grouping with the network shuffle.
 
 ### Shuffling Data
 
@@ -727,35 +685,6 @@ values: [
     ('activity',  {page: '/home',  time: '10:00'}),
     ('activity',  {page: '/about', time: '10:05'}),
 ]
-```
-
-```python
-def reduce_side_join(key, values):
-    """
-    Sort-merge join: reducer sees records for one key,
-    with the profile (if present) appearing first.
-    """
-    profile = None
-    activities = []
-
-    for tag, record in values:
-        if tag == 'profile':
-            profile = record
-        else:  # tag == 'activity'
-            activities.append(record)
-
-    if profile is None:
-        # No profile for this user; skip
-        return
-
-    for activity in activities:
-        yield {
-            'user_id': key,
-            'name':    profile['name'],
-            'dob':     profile['dob'],
-            'page':    activity['page'],
-            'time':    activity['time'],
-        }
 ```
 
 #### Broadcast Hash Join
@@ -1056,11 +985,7 @@ A few examples from across industries:
 
 ### Extract–Transform–Load
 
-ETL pipelines extract data from a production database, transform it, and load the results into a downstream system such as a data warehouse. Batch jobs are often used for ETL, especially when the downstream system is a data warehouse.
-
-The parallel nature of batch jobs makes them a great fit for data transformation. Many transformations — filtering, projecting fields, joining — are "embarrassingly parallel."
-
-Batch processing environments also come with robust workflow schedulers, which make it easy to schedule, orchestrate, and debug ETL jobs. When a failure occurs, schedulers often retry to mitigate transient issues. Repeatedly failing jobs are marked as failed, which helps developers spot which job in their pipeline stopped working. Schedulers like Airflow include built-in source, sink, and query operators for MySQL, PostgreSQL, Snowflake, Spark, Flink, and dozens of other popular systems.
+ETL pipelines extract data from a production database, transform it, and load the results into a downstream system such as a data warehouse. The parallel nature of batch jobs makes them a great fit for data transformation. Many transformations — filtering, projecting fields, joining — are "embarrassingly parallel."
 
 ```mermaid
 graph LR
@@ -1083,11 +1008,9 @@ graph LR
     style LOAD fill:#DDA0DD
 ```
 
-Failed files can be inspected to see what went wrong, and ETL jobs can be fixed and rerun. For example, if an input file is missing a field that a transformation expects, an engineer can update the transformation or the producing job. The same applies to schema evolution in upstream sources — data contracts (a standard for inter-team data publishing) help with this.
+Batch processing environments also come with robust workflow schedulers that make it easy to schedule, orchestrate, and debug ETL jobs. When a failure occurs, schedulers often retry to mitigate transient issues; repeatedly failing jobs are marked as failed, which helps developers spot which job stopped working. Schedulers like Airflow include built-in source, sink, and query operators for MySQL, PostgreSQL, Snowflake, Spark, Flink, and dozens of other popular systems. Failed files can be inspected to see what went wrong, and ETL jobs can be fixed and rerun. The same applies to schema evolution in upstream sources — data contracts (a standard for inter-team data publishing) help with this.
 
-Data pipelines used to be managed by a single data engineering team, because writing and managing complex batch pipelines was considered unfair to ask of product teams. Recently, improvements in batch processing models and metadata management have made it much easier for engineers across an organization to contribute to and manage their own data pipelines. **Data mesh**, **data contract**, and **data fabric** practices provide standards and tools to help teams safely publish their data.
-
-Data pipelines and analytical queries have begun to share not only processing models but execution engines as well. Many batch ETL jobs now run on the same systems as the analytical queries that read their output. It is not uncommon to see both data pipeline transformations and analytical queries run as SparkSQL, Trino, or DuckDB queries. This blurs the line between application engineering, data engineering, analytics engineering, and business analysis.
+Data pipelines used to be managed by a single data engineering team, because writing and managing complex batch pipelines was considered unfair to ask of product teams. Improvements in batch processing models and metadata management have made it much easier for engineers across an organization to contribute to and manage their own data pipelines. **Data mesh**, **data contract**, and **data fabric** practices provide standards and tools to help teams safely publish their data. Many batch ETL jobs now run on the same engines as the analytical queries that read their output — SparkSQL, Trino, or DuckDB. This blurs the line between application engineering, data engineering, analytics engineering, and business analysis.
 
 ### Analytics
 
@@ -1221,11 +1144,11 @@ Streaming does not inherently solve the all-or-nothing guarantee. To make this w
 
 Another pattern, more common when bootstrapping databases, is to build a brand-new database inside the batch job and bulk-load files directly into the database from a distributed filesystem, object store, or local filesystem. Many data systems offer bulk-import tools (TiDB's Lightning, Apache Pinot's Hadoop import jobs). RocksDB offers an API to bulk-import Sorted String Table (SST) files from batch jobs.
 
-Building databases in batch and bulk-importing the data is very fast and makes it easier to atomically switch between dataset versions. It can be challenging to incrementally update datasets from batch jobs that build brand-new databases, so a hybrid approach (Venice supports hybrid stores that allow both batch row-based updates and full dataset swaps) is common when both bootstrapping and incremental loads are needed.
+Building databases in batch and bulk-importing the data is fast and makes it easier to atomically switch between dataset versions. It can be challenging to incrementally update datasets from batch jobs that build brand-new databases, so a hybrid approach (Venice supports hybrid stores that allow both batch row-based updates and full dataset swaps) is common when both bootstrapping and incremental loads are needed.
 
 ---
 
-## 5. Summary
+## Summary
 
 This chapter explored the design and implementation of batch processing systems. We started with the classic Unix toolchain (`awk`, `sort`, `uniq`, etc.) to illustrate fundamental batch primitives such as sorting and counting. We then scaled up to distributed systems, where batch frameworks process immutable, bounded input datasets to produce output data, allowing reruns and debugging without side effects.
 
@@ -1267,8 +1190,6 @@ We surveyed batch processing models, starting with MapReduce and its canonical `
 
 We saw that as batch systems matured, focus shifted to usability. Support was added for high-level query languages like SQL and DataFrame APIs, making batch jobs more accessible and easier to optimize. The batch framework takes jobs written in these languages and automatically determines how to execute them efficiently on a cluster.
 
-### Comparison Table
-
 | System / Approach | Strengths | Weaknesses | Best For |
 |---|---|---|---|
 | **Unix tools** | Simple, fast on a single machine | Doesn't scale beyond one machine | Ad-hoc analysis, small data |
@@ -1277,23 +1198,13 @@ We saw that as batch systems matured, focus shifted to usability. Support was ad
 | **Cloud data warehouses** | Managed, SQL-first, good for ad hoc queries | Can be expensive, limited for non-relational data | Ad hoc analytics, data marts |
 | **Workflow orchestrators** | DAG dependencies, retries, observability | A separate system to operate | Multi-job pipelines |
 
-### Key Takeaways
+**Key takeaways:**
 
-1. **Unix philosophy still applies**: Simple, composable tools with uniform interfaces (stdin/stdout) work because they separate concerns. Sorting scales to disk when memory is exhausted.
-
-2. **MapReduce pioneered distributed batch processing**: It brought fault tolerance through replication, data locality optimization, and a simple programming model. Its materialization overhead and limited operator set have been superseded by dataflow engines.
-
-3. **Dataflow engines improve on MapReduce**: They express computations as arbitrary DAGs (not just map-then-reduce), pipeline operations in memory, schedule on data locality, and reuse processes across operators.
-
-4. **Different join algorithms for different shapes**: Sort-merge joins scale to any data size but require a sort phase. Broadcast hash joins avoid the reduce phase when one side fits in memory. Partitioned hash joins avoid a global sort when both sides are co-partitioned.
-
-5. **Fault tolerance is the price of running on commodity hardware**: MapReduce writes intermediate state to the DFS. Spark recomputes from lineage. Flink checkpoints periodically. Each design is a trade-off between recomputation and materialization.
-
-6. **High-level abstractions win**: SQL on batch engines, DataFrame APIs, and cost-based query optimizers all improve usability and execution efficiency. Cloud data warehouses and batch frameworks are converging.
-
-7. **Workflow orchestration matters at scale**: Pipelines of 50–100 jobs are common, and many teams' outputs feed other teams' jobs. Tools like Airflow, Dagster, and Prefect are essential for managing dependencies, retries, and observability.
-
-8. **Batch outputs must reach production carefully**: Avoid writing one record at a time from many parallel tasks to an OLTP database. Buffer through a streaming system or bulk-load new dataset versions.
+- **Unix philosophy still applies**: Simple, composable tools with uniform interfaces (stdin/stdout) work because they separate concerns. Sorting scales to disk when memory is exhausted.
+- **MapReduce pioneered distributed batch processing**: It brought fault tolerance through replication, data locality optimization, and a simple programming model. Its materialization overhead and limited operator set have been superseded by dataflow engines.
+- **Dataflow engines improve on MapReduce**: They express computations as arbitrary DAGs (not just map-then-reduce), pipeline operations in memory, schedule on data locality, and reuse processes across operators.
+- **Different join algorithms for different shapes**: Sort-merge joins scale to any data size but require a sort phase. Broadcast hash joins avoid the reduce phase when one side fits in memory. Partitioned hash joins avoid a global sort when both sides are co-partitioned.
+- **High-level abstractions win**: SQL on batch engines, DataFrame APIs, and cost-based query optimizers all improve usability and execution efficiency. Cloud data warehouses and batch frameworks are converging.
 
 ---
 

@@ -1,5 +1,13 @@
 # Chapter 2: Defining Nonfunctional Requirements
 
+## TL;DR
+
+- Performance, reliability, scalability, and maintainability are the four nonfunctional requirements that recur throughout the book; this chapter defines them using a Twitter-style home-timeline case study.
+- Performance is described by **throughput** (work per unit time) and **response-time** distributions; **percentiles** (p50/p95/p99/p999) are preferred over averages for understanding user experience.
+- **Tail latency amplification**: a small fraction of slow backend calls dominates end-user latency when calls run in parallel. Design for p99/p999, not just the median.
+- **Reliability** means "continuing to work correctly, even when things go wrong." Distinguish **faults** (one component fails) from **failures** (system stops serving users). Defend against retry storms and metastable failures with exponential backoff with jitter, circuit breakers, load shedding, and backpressure.
+- **Scalability** is multidimensional — say along which axis you can grow (CPU, memory, disk, network, geography, request rate, data volume). **Shared-nothing** architectures scale most linearly but pay distributed-systems complexity. **Maintainability** is mostly about the organization: operability, simplicity, evolvability, and blameless postmortems.
+
 ## Introduction
 
 The terminology introduced in this chapter will also be useful in the following chapters, when we go into the details of how data-intensive systems are implemented. However, abstract definitions can be quite dry; to make the ideas more concrete, we will start this chapter with a case study of a social networking service, which will provide practical examples of performance and scalability.
@@ -82,7 +90,7 @@ CREATE TABLE follows (
 CREATE INDEX follows_followee_idx ON follows (followee_id);
 ```
 
-Notice the secondary indexes: `(sender_id, timestamp DESC)` makes “recent posts by a user” cheap, and `(followee_id)` makes the fan-out lookup — “who follows this person?” — cheap. The shape of the indexes is determined by the queries we plan to run.
+Notice the secondary indexes: `(sender_id, timestamp DESC)` makes "recent posts by a user" cheap, and `(followee_id)` makes the fan-out lookup — "who follows this person?" — cheap. The shape of the indexes is determined by the queries we plan to run.
 
 ```mermaid
 graph LR
@@ -99,7 +107,7 @@ graph LR
     style FOLLOWS fill:#DDA0DD
 ```
 
-Let’s say the main read operation that our social network must support is the **home timeline**, which displays recent posts by people the user is following (for simplicity we will ignore ads, suggested posts from people they are not following, and other extensions). We could write the following SQL query to get the home timeline for a particular user:
+Let's say the main read operation that our social network must support is the **home timeline**, which displays recent posts by people the user is following (for simplicity we will ignore ads, suggested posts from people they are not following, and other extensions). We could write the following SQL query to get the home timeline for a particular user:
 
 ```sql
 SELECT posts.*, users.* FROM posts
@@ -112,9 +120,9 @@ LIMIT 1000
 
 To execute this query, the database will use the `follows` table to find everybody who `current_user` is following, look up recent posts by those users, and sort them by timestamp to get the most recent 1,000 posts by any of the followed users.
 
-Posts are supposed to be timely, so let’s assume that after somebody makes a post, we want their followers to be able to see it within five seconds. One approach is for the user’s client to repeat the preceding query every five seconds while the user is online (this is known as **polling**). If we assume that 10 million users are online and logged in at the same time, that would mean running the query 2 million times per second. Even if we were to poll less frequently, this is a lot.
+Posts are supposed to be timely, so let's assume that after somebody makes a post, we want their followers to be able to see it within five seconds. One approach is for the user's client to repeat the preceding query every five seconds while the user is online (this is known as **polling**). If we assume that 10 million users are online and logged in at the same time, that would mean running the query 2 million times per second. Even if we were to poll less frequently, this is a lot.
 
-This query is also quite expensive: if a user is following 200 people, the query needs to fetch a list of recent posts by each of those 200 people and merge those lists. **Two million timeline queries per second times 200 followed accounts makes 400 million lookups per second** — a huge number. And that’s the average case. Some users follow tens of thousands of accounts; for them, this query is very expensive to execute and difficult to make fast.
+This query is also quite expensive: if a user is following 200 people, the query needs to fetch a list of recent posts by each of those 200 people and merge those lists. **Two million timeline queries per second times 200 followed accounts makes 400 million lookups per second** — a huge number. And that's the average case. Some users follow tens of thousands of accounts; for them, this query is very expensive to execute and difficult to make fast.
 
 #### A quick poll-vs-push comparison
 
@@ -126,13 +134,11 @@ This query is also quite expensive: if a user is following 200 people, the query
 | Worst case | Users following tens of thousands | Celebrity with millions of followers |
 | Best fit for | Low write rate, simple system | High write rate, latency-sensitive reads |
 
-Neither is uniformly better. The case study lands on fan-out on write because reads dominate and freshness matters, but it inherits the celebrity-cost problem and has to special-case it.
-
 ### Materializing and Updating Timelines
 
-How can we do better? First, instead of polling, it would be better if the server actively pushed new posts to any followers who are currently online. Second, we should precompute the results of the query so that a user’s request for their home timeline can be served from a cache.
+How can we do better? First, instead of polling, it would be better if the server actively pushed new posts to any followers who are currently online. Second, we should precompute the results of the query so that a user's request for their home timeline can be served from a cache.
 
-Imagine that for each user, we store a data structure containing their home timeline (i.e., the recent posts by people they are following). Every time a user makes a post, we look up all their followers and insert that post into the home timeline of each follower — like delivering a message to a mailbox. Now when a user logs in, we can simply give them this precomputed home timeline. Moreover, to receive a notification about any new posts on their timeline, the user’s client simply needs to subscribe to the stream of posts being added to their home timeline.
+Imagine that for each user, we store a data structure containing their home timeline (i.e., the recent posts by people they are following). Every time a user makes a post, we look up all their followers and insert that post into the home timeline of each follower — like delivering a message to a mailbox. Now when a user logs in, we can simply give them this precomputed home timeline. Moreover, to receive a notification about any new posts on their timeline, the user's client simply needs to subscribe to the stream of posts being added to their home timeline.
 
 The downside of this approach is that we now need to do more work every time a user makes a post, because the home timelines are derived data that needs to be updated. When one initial request results in several downstream requests being carried out, we use the term **fan-out** to describe the factor by which the number of requests increases.
 
@@ -159,14 +165,14 @@ graph LR
     style E fill:#87CEEB
 ```
 
-At a rate of 5,800 posts per second, if the average post reaches 200 followers (i.e., a fan-out factor of 200), we will need to do just over **1 million home timeline writes per second**. This is a lot, but it’s still a significant saving compared to the 400 million per-sender post lookups per second that we would otherwise have to do.
+At a rate of 5,800 posts per second, if the average post reaches 200 followers (i.e., a fan-out factor of 200), we will need to do just over **1 million home timeline writes per second**. This is a lot, but it's still a significant saving compared to the 400 million per-sender post lookups per second that we would otherwise have to do.
 
-If the rate of posts spikes because of a special event, we don’t have to do the timeline deliveries immediately — we can enqueue them and accept that it will temporarily take a bit longer for posts to show up in followers’ timelines. Even during such load spikes, timelines remain fast to load, since we simply serve them from a cache.
+If the rate of posts spikes because of a special event, we don't have to do the timeline deliveries immediately — we can enqueue them and accept that it will temporarily take a bit longer for posts to show up in followers' timelines. Even during such load spikes, timelines remain fast to load, since we simply serve them from a cache.
 
 This process of precomputing and updating the results of a query is called **materialization**, and the timeline cache is an example of a **materialized view** (a concept we will discuss further in later chapters). The materialized view speeds up reads, but in return we have to do more work on writes. The cost of writes for most users is modest, but a social network also has to consider some extreme cases:
 
-- If a user is following a very large number of accounts, and those accounts post a lot, that user will have a high rate of writes to their materialized timeline. However, that user is not likely reading all the posts in their timeline, so it’s OK to simply drop some of their timeline writes and show the user only a sample of the posts from the accounts they’re following.
-- When a celebrity account with a very large number of followers makes a post, we have to do a lot of work to insert that post into the home timelines of each of their millions of followers. In this case, dropping some of those writes is not OK. One way of solving this problem is to handle celebrity posts separately from everyone else’s posts: we can save ourselves the effort of adding celebrity posts to millions of timelines by storing them separately and merging them with the materialized timeline when it is read. Despite such optimizations, handling celebrities on a social network can require a lot of infrastructure.
+- If a user is following a very large number of accounts, and those accounts post a lot, that user will have a high rate of writes to their materialized timeline. However, that user is not likely reading all the posts in their timeline, so it's OK to simply drop some of their timeline writes and show the user only a sample of the posts from the accounts they're following.
+- When a celebrity account with a very large number of followers makes a post, we have to do a lot of work to insert that post into the home timelines of each of their millions of followers. In this case, dropping some of those writes is not OK. One way of solving this problem is to handle celebrity posts separately from everyone else's posts: we can save ourselves the effort of adding celebrity posts to millions of timelines by storing them separately and merging them with the materialized timeline when it is read. Despite such optimizations, handling celebrities on a social network can require a lot of infrastructure.
 
 **Example: Twitter's scaling challenge** — When the site was just starting out, the home timeline was computed on read using the SQL query shown earlier. As load grew, this became untenable: even with aggressive caching, the SQL join plus merge-sort over potentially thousands of followed users was too slow at p99. Twitter moved to a hybrid: most posts are fan-out-on-write into per-user timeline caches, while posts from celebrities are merged in at read time. This is the same shape as the case study in this chapter.
 
@@ -210,8 +216,6 @@ The book introduces two metric families — **response time** and **throughput**
 - **Fan-out factor**: how many downstream requests a single user-facing request triggers (e.g., 200 follower-timeline updates per post).
 - **Peak vs. average**: the social network averages 5,800 posts/sec but spikes to 150,000. Capacity planning must be done against the peak (or the headroom you can tolerate below the peak), not the average.
 
-A useful sanity check: can you state, for each tier of your system, what its **peak sustained throughput** is and how close to that peak your busiest hour runs? If the answer is "I don't know," the system is observability-poor and you cannot reason about whether it can scale.
-
 ---
 
 ## Describing Performance
@@ -219,9 +223,9 @@ A useful sanity check: can you state, for each tier of your system, what its **p
 Most discussions of software performance consider two main types of metric:
 
 - **Response time**: The elapsed time from the moment when a user makes a request until they receive the requested answer. The unit of measurement is seconds (or milliseconds, or microseconds).
-- **Throughput**: The number of requests per second, or the data volume per second, that the system is processing. For a given allocation of hardware resources, there is a maximum throughput that can be handled. The unit of measurement is “somethings per second.”
+- **Throughput**: The number of requests per second, or the data volume per second, that the system is processing. For a given allocation of hardware resources, there is a maximum throughput that can be handled. The unit of measurement is "somethings per second."
 
-In the social network case study, “posts per second” and “timeline writes per second” are throughput metrics, whereas “time it takes to load the home timeline” and “time until a post is delivered to followers” are response time metrics.
+In the social network case study, "posts per second" and "timeline writes per second" are throughput metrics, whereas "time it takes to load the home timeline" and "time until a post is delivered to followers" are response time metrics.
 
 Throughput and response time are often related. The service has a low response time when request throughput is low, but response time increases as load increases. This is because of **queueing**: when a request arrives on a highly loaded system, the CPU is likely already in the process of handling an earlier request, and therefore the incoming request needs to wait until the earlier request has been completed. As throughput approaches the maximum that the hardware can handle, queueing delays increase sharply.
 
@@ -242,7 +246,7 @@ graph LR
     style SAT fill:#ffcccc
 ```
 
-### When an Overloaded System Won’t Recover
+### When an Overloaded System Won't Recover
 
 If a system is close to overload, with throughput pushed close to the limit, it can sometimes enter a vicious cycle where it becomes less efficient and hence even more overloaded. For example, if a long queue of requests is waiting to be handled, response times may increase so much that clients time out and resend their requests. This causes the rate of requests to increase even further, making the problem worse — a **retry storm**. Even when the load is reduced again, such a system may remain in an overloaded state until it is rebooted or otherwise reset. This phenomenon is called a **metastable failure**, and it can cause serious outages in production systems.
 
@@ -269,17 +273,6 @@ graph LR
     style X fill:#ffcccc
 ```
 
-```mermaid
-graph LR
-    A["System near<br/>saturation"] -->|"Queue grows"| B["Response<br/>time grows"]
-    B -->|"Clients<br/>time out"| C["Clients<br/>retry"]
-    C -->|"More load"| A
-
-    style A fill:#ffeb3b
-    style B fill:#FFA500
-    style C fill:#ffcccc
-```
-
 To avoid retries overloading a service, you can:
 
 - Increase and randomize the time between successive retries on the client side (**exponential backoff** with jitter)
@@ -288,16 +281,11 @@ To avoid retries overloading a service, you can:
 - Server-side: send back responses asking clients to slow down (**backpressure**)
 - Choose queueing and load-balancing algorithms with care (e.g., least-loaded, not just round-robin)
 
-In terms of performance metrics, the response time is usually what users care about the most, whereas the throughput determines the required computing resources (e.g., how many servers you need) and hence the cost of serving a particular workload. If throughput is likely to increase beyond the current hardware’s capability, the capacity needs to be expanded; a system is said to be **scalable** if its maximum throughput can be significantly increased by adding computing resources.
+In terms of performance metrics, the response time is usually what users care about the most, whereas the throughput determines the required computing resources (e.g., how many servers you need) and hence the cost of serving a particular workload. If throughput is likely to increase beyond the current hardware's capability, the capacity needs to be expanded; a system is said to be **scalable** if its maximum throughput can be significantly increased by adding computing resources.
 
 ### Latency and Response Time
 
-“Latency” and “response time” are sometimes used interchangeably, but in this book we will use these and a few related terms in a specific way:
-
-- The **response time** is what the client sees; it includes all delays incurred anywhere in the system.
-- The **service time** is the duration for which the service is actively processing the client’s request.
-- **Queueing delays** can occur at several points in the flow — for example, after a request is received, it might need to wait until a CPU is available before it can be processed, or a response packet might need to be buffered before it is sent over the network if other tasks on the same machine are sending a lot of data via the outbound network interface.
-- **Latency** is a catchall term for time during which a request is not being actively processed — that is, during which it is latent. In particular, **network latency** or **network delay** refers to the time that a request and response spend traveling through the network.
+"Latency" and "response time" are sometimes used interchangeably. The sequence diagram below shows the specific way this book uses these and related terms.
 
 ```mermaid
 sequenceDiagram
@@ -347,16 +335,16 @@ graph TB
     style R10 fill:#ffcccc
 ```
 
-It’s common to report the **average response time** of a service (technically, the arithmetic mean, which you find by summing all the response times and dividing by the number of requests). The mean response time is useful for estimating throughput limits. However, the mean is not a very good metric if you want to know your “typical” response time, because it doesn’t tell you how many users actually experienced that delay.
+It's common to report the **average response time** of a service (technically, the arithmetic mean, which you find by summing all the response times and dividing by the number of requests). The mean response time is useful for estimating throughput limits. However, the mean is not a very good metric if you want to know your "typical" response time, because it doesn't tell you how many users actually experienced that delay.
 
-Usually it’s better to use **percentiles**. If you take your list of response times and sort it from fastest to slowest:
+Usually it's better to use **percentiles**. If you take your list of response times and sort it from fastest to slowest:
 
 - The **median** is the halfway point — for example, if your median response time is 200 ms, that means half your requests return in less than 200 milliseconds (ms), and half your requests take longer. This makes the median a good metric if you want to know how long users typically have to wait. The median is also known as the 50th percentile, sometimes abbreviated as **p50**.
 - To figure out how bad your outliers are, you can look at higher percentiles: the 95th, 99th, and 99.9th percentiles are common (abbreviated **p95**, **p99**, and **p999**). For example, if the 95th percentile response time is 1.5 seconds, that means 95 out of 100 requests take less than 1.5 seconds, and 5 out of 100 requests take 1.5 seconds or more.
 
-High response-time percentiles, also known as **tail latencies**, are important because they directly affect users’ experience of the service. For example, **Amazon describes response time requirements for internal services in terms of the 99.9th percentile**, even though this affects only 1 in 1,000 requests. This is because the customers with the slowest requests are often those who have the most data on their accounts, as they have made many purchases — that is, they’re the most valuable customers. It’s important to keep those customers happy by ensuring the website is fast for them.
+High response-time percentiles, also known as **tail latencies**, are important because they directly affect users' experience of the service. For example, **Amazon describes response time requirements for internal services in terms of the 99.9th percentile**, even though this affects only 1 in 1,000 requests. This is because the customers with the slowest requests are often those who have the most data on their accounts, as they have made many purchases — that is, they're the most valuable customers. It's important to keep those customers happy by ensuring the website is fast for them.
 
-Optimizing the 99.99th percentile (the slowest 1 in 10,000 requests) was deemed too expensive and found to not yield enough benefit for Amazon’s purposes. Reducing response times at very high percentiles is difficult because they are easily affected by random events outside of your control, and the benefits are diminishing.
+Optimizing the 99.99th percentile (the slowest 1 in 10,000 requests) was deemed too expensive and found to not yield enough benefit for Amazon's purposes. Reducing response times at very high percentiles is difficult because they are easily affected by random events outside of your control, and the benefits are diminishing.
 
 ### The User Impact of Response Times
 
@@ -391,7 +379,7 @@ graph LR
     style F fill:#FFA500
 ```
 
-Percentiles are often used in **service level objectives (SLOs)** and **service level agreements (SLAs)** as ways of defining the expected performance and availability of a service. For example, an SLO may set a target for a service to have a median response time of less than 200 ms and a 99th percentile under 1 second, and a target that at least 99.9% of valid requests result in non-error responses. An SLA is a contract that specifies what happens if the SLO is not met (e.g., customers may be entitled to a refund). That’s the basic idea, at least; in practice, defining good availability metrics for SLOs and SLAs is not straightforward.
+Percentiles are often used in **service level objectives (SLOs)** and **service level agreements (SLAs)** as ways of defining the expected performance and availability of a service. For example, an SLO may set a target for a service to have a median response time of less than 200 ms and a 99th percentile under 1 second, and a target that at least 99.9% of valid requests result in non-error responses. An SLA is a contract that specifies what happens if the SLO is not met (e.g., customers may be entitled to a refund). That's the basic idea, at least; in practice, defining good availability metrics for SLOs and SLAs is not straightforward.
 
 ```mermaid
 graph LR
@@ -421,7 +409,11 @@ The simplest implementation is to keep a list of response times for all requests
 
 > **Beware** that averaging percentiles (e.g., to reduce the time resolution or to combine data from several machines) is mathematically meaningless. The right way of aggregating response time data is to add the histograms.
 
-#### Code Example: Computing Response-Time Percentiles
+#### Patterns in code
+
+The following short examples illustrate the patterns discussed above.
+
+**Computing response-time percentiles (NumPy):**
 
 The following example shows how to compute the mean, median, p95, p99, and p999 of a synthetic response-time distribution using NumPy. It also demonstrates the pitfall of averaging percentiles.
 
@@ -459,7 +451,7 @@ print(f"true combined p99 = {np.percentile(response_times_ms, 99):.2f} ms")
 
 The two shards look healthy in isolation (each has its own p99), but naively averaging them gives a number that does not correspond to any percentile of the actual combined workload. The right way to combine is to merge the underlying **histograms**, not to average the summary statistics.
 
-#### Code Example: Estimating Percentiles with HdrHistogram
+**Estimating percentiles with HdrHistogram:**
 
 Sketch of how HdrHistogram is used in practice (real API; see the library docs for details).
 
@@ -484,9 +476,9 @@ print(f"p999 : {hist.get_value_at_percentile(99.9)} ms")
 # Percentiles can also be merged across machines, unlike naive averaging.
 ```
 
-HdrHistogram supports merging two histograms, which lets you aggregate percentile data from multiple machines without losing accuracy. This is the key insight behind the book’s warning about averaging percentiles.
+HdrHistogram supports merging two histograms, which lets you aggregate percentile data from multiple machines without losing accuracy. This is the key insight behind the book's warning about averaging percentiles.
 
-#### Code Example: Exponential Backoff with Jitter
+**Exponential backoff with jitter:**
 
 Once you have response-time metrics, you can act on them. A common pattern when a downstream service is slow is to **back off** the client. The retry storm discussed earlier happens when naive clients hammer a struggling service; adding jitter to exponential backoff breaks the synchrony.
 
@@ -527,7 +519,7 @@ def with_retries(
 
 When thousands of clients all see the same failure at the same time, the key is to **de-synchronize** their retries. Full jitter (`uniform(0, delay)`) is one of the most effective ways to do this; equal jitter (`delay/2 + uniform(0, delay/2)`) is another.
 
-#### Code Example: A Simple Circuit Breaker
+**A simple circuit breaker:**
 
 To prevent retries from pounding a known-failing downstream, you wrap the call in a **circuit breaker**. While the breaker is open, calls fail fast instead of timing out — which reduces tail latency for the caller and gives the downstream time to recover.
 
@@ -590,7 +582,7 @@ class CircuitBreaker:
 
 When the breaker is open, callers get a fast fallback (e.g., a cached or default value) instead of waiting for a 30-second timeout. After a cooldown, the breaker lets a single probe call through; if it succeeds, the breaker closes again.
 
-#### Code Example: A Sliding-Window Percentile Monitor
+**A sliding-window percentile monitor:**
 
 A real-world monitoring loop roughly looks like this: tick every minute, record response times into a histogram, and emit summary metrics.
 
@@ -642,7 +634,7 @@ if __name__ == "__main__":
 
 This is a toy, but it captures the structure: every observation is timestamped, the window is bounded, and querying the percentile is a single sort over the buffered values. The trade-off you make in production is between memory (keep raw samples), CPU (sort on read), and accuracy (use a sketch like t-digest or DDSketch).
 
-#### Code Example: Tail-Latency Amplification, Simulated
+**Tail-latency amplification, simulated:**
 
 The book points out that even a small percentage of slow backend calls dominates end-user latency when several calls are made in parallel. Here's a tiny simulation that shows the effect:
 
@@ -688,12 +680,12 @@ Everybody has an intuitive idea of what it means for something to be reliable or
 - Its performance is good enough for the required use case, under the expected load and data volume.
 - The system prevents any unauthorized access and abuse.
 
-If all those things together mean “working correctly,” then we can understand **reliability** as meaning, roughly, “continuing to work correctly, even when things go wrong.”
+If all those things together mean "working correctly," then we can understand **reliability** as meaning, roughly, "continuing to work correctly, even when things go wrong."
 
 To be more precise about things going wrong, we will distinguish between **faults** and **failures**:
 
 - **Fault**: A fault occurs when a particular part of a system stops working correctly — for example, if a single hard drive malfunctions, or a single machine crashes, or an external service (that the system depends on) has an outage.
-- **Failure**: A failure occurs when the system as a whole stops providing the required service to the user — in other words, when it does not meet the SLO.
+- **Failure**: A failure occurs when the system as a whole stops providing the required service to the user — when it does not meet the SLO.
 
 The distinction between faults and failures can be confusing because they are the same thing, just at different levels. For example, if a hard drive stops working, we say that the hard drive has failed; if the system consists of only that one hard drive, it has stopped providing the required service and thus has also failed. However, if the system consists of multiple hard drives, the failure of a single hard drive is only a fault from the point of view of the bigger system, and the bigger system might be able to tolerate that fault by having a copy of the data on another hard drive.
 
@@ -751,7 +743,7 @@ When we think of causes of system failure, hardware faults quickly come to mind:
 - **Data in RAM can be corrupted**, either because of random events such as cosmic rays or because of permanent physical defects. Even when memory with error-correcting codes (ECC) is used, more than 1% of machines encounter an uncorrectable error in a given year, which typically leads to a crash of the machine and the affected memory module needing to be replaced. Furthermore, certain pathological memory access patterns can flip bits with high probability.
 - **An entire datacenter might become unavailable** (e.g., because of a power outage or network misconfiguration) or even be permanently destroyed (e.g., by fire, flood, or earthquake). A solar storm, which induces large electrical currents in long-distance wires when the sun ejects a large mass of charged particles, could damage power grids and undersea network cables. Although such large-scale failures are rare, their impact can be catastrophic if a service cannot tolerate the loss of a datacenter.
 
-These events are rare enough that you often don’t need to worry about them when working on a small system, as long as you can easily replace hardware that becomes faulty. However, in a large-scale system, hardware faults happen often enough that they become part of normal system operation.
+These events are rare enough that you often don't need to worry about them when working on a small system, as long as you can easily replace hardware that becomes faulty. However, in a large-scale system, hardware faults happen often enough that they become part of normal system operation.
 
 ```mermaid
 graph LR
@@ -801,19 +793,24 @@ Although hardware failures can be weakly correlated, they are still mostly indep
 
 The bugs that cause these kinds of software faults often lie dormant for a long time until they are triggered by an unusual set of circumstances. In those circumstances, it is revealed that the software is making some kind of assumption about its environment — and while that assumption is usually true, it eventually stops being true for some reason.
 
-The problem of systematic faults in software has no quick solution. Lots of small things can help: carefully thinking about assumptions and interactions in the system; thorough testing; ensuring process isolation; allowing processes to crash and restart; avoiding feedback loops such as retry storms; measuring, monitoring, and analyzing system behavior in production.
+The problem of systematic faults in software has no quick solution. The following table combines the engineering practices most teams rely on, drawn from the discussion of correlated software faults above and from operator mistakes below.
 
-### Humans and Reliability
+| Practice | What it addresses |
+| --- | --- |
+| Careful reasoning about assumptions and interactions | Surfaces implicit dependencies before they bite |
+| Thorough testing (handwritten + property-based on random inputs) | Catches dormant bugs that lie in wait for unusual inputs |
+| Process isolation | Contains runaway resource use to one process |
+| Allowing processes to crash and restart | Limits blast radius of correlated software bugs |
+| Avoiding retry-storm feedback loops | Prevents clients amplifying load on a degraded service |
+| Production measurement, monitoring, and analysis | Detects drift between assumptions and reality |
+| Rollback mechanisms for configuration changes | Reverts operator mistakes quickly |
+| Gradual rollouts of new code | Limits the blast radius of a bad release |
+| Detailed monitoring and observability tooling | Diagnoses production issues |
+| Interfaces that encourage "the right thing" | Reduces the chance of operator mistakes |
 
-Humans design and build software systems, and the operators who keep the systems running are also human. Unlike machines, humans don’t just follow rules; one of their strengths is being creative and adaptive in getting their jobs done. However, this characteristic also leads to unpredictability, and sometimes to mistakes that can lead to failures, despite best intentions. For example, **one study of large internet services found that configuration changes by operators were the leading cause of outages**, whereas hardware faults (servers or network) played a role in only 10%–25% of cases.
+The last row, blameless postmortems, is cultural rather than technical, but it is the mechanism by which the rest of the practices get stronger over time.
 
-It is tempting to label such problems as “human error” and to wish that they could be solved by better controlling human behavior through tighter procedures and compliance with rules. However, **blaming people for mistakes is counterproductive**. What we call “human error” is not really the cause of an incident, but rather a symptom of a problem with the sociotechnical system in which people are trying their best to do their jobs. Often complex systems have emergent behavior, in which unexpected interactions between components may also lead to failures.
-
-Various technical measures can help minimize the impact of human mistakes, including thorough testing (both handwritten tests and property testing on lots of random inputs), rollback mechanisms for quickly reverting configuration changes, gradual rollouts of new code, detailed and clear monitoring, observability tools for diagnosing production issues, and well-designed interfaces that encourage “the right thing” and discourage “the wrong thing.”
-
-However, these all require an investment of time and money, and in the pragmatic reality of everyday business, organizations often prioritize revenue-generating activities over measures that increase their systems’ resilience against mistakes. Given a choice between more features and more testing, many organizations understandably choose features. Then, when a preventable mistake inevitably occurs, blaming the person who made the mistake does not make sense; the problem is the organization’s priorities.
-
-Increasingly, organizations are adopting a culture of **blameless postmortems**: after an incident, the people involved are encouraged to share full details about what happened, without fear of punishment, since this allows others in the organization to learn how to prevent similar problems in the future. This process may uncover a need to change business priorities, invest in areas that have been neglected, change the incentives for the people involved, or bring another systemic issue to management’s attention.
+Increasingly, organizations are adopting a culture of **blameless postmortems**: after an incident, the people involved are encouraged to share full details about what happened, without fear of punishment, since this allows others in the organization to learn how to prevent similar problems in the future. This process may uncover a need to change business priorities, invest in areas that have been neglected, change the incentives for the people involved, or bring another systemic issue to management's attention.
 
 ```mermaid
 graph LR
@@ -832,7 +829,7 @@ graph LR
     style LEARN fill:#FFD700
 ```
 
-As a general principle, when investigating an incident, you should be suspicious of simplistic answers. “Bob should have been more careful when deploying that change” is not productive, but neither is “We must rewrite the backend in Haskell.” Instead, management should take the opportunity to learn the details of how the sociotechnical system works from the point of view of the people who work with it every day, and take steps to improve it based on this feedback.
+As a general principle, when investigating an incident, you should be suspicious of simplistic answers. "Bob should have been more careful when deploying that change" is not productive, but neither is "We must rewrite the backend in Haskell." Instead, management should take the opportunity to learn the details of how the sociotechnical system works from the point of view of the people who work with it every day, and take steps to improve it based on this feedback.
 
 ### How Important Is Reliability?
 
@@ -861,23 +858,23 @@ The danger is treating every system as tier-1, or — the more common failure mo
 
 ## Scalability
 
-Even if a system is working reliably today, that doesn’t mean it will necessarily work reliably in the future. One common reason for degradation is increased load. Perhaps the system has grown from 10,000 concurrent users to 100,000 concurrent users, or from 1 million to 10 million. Perhaps it is processing much larger volumes of data than it did before.
+Even if a system is working reliably today, that doesn't mean it will necessarily work reliably in the future. One common reason for degradation is increased load. Perhaps the system has grown from 10,000 concurrent users to 100,000 concurrent users, or from 1 million to 10 million. Perhaps it is processing much larger volumes of data than it did before.
 
-**Scalability** is the term we use to describe a system’s ability to cope with increased load. Sometimes, when discussing scalability, people make comments along the lines of, “You’re not Google or Amazon. Stop worrying about scale and just use a relational database.” Whether this maxim applies to you depends on the type of application you are building.
+**Scalability** is the term we use to describe a system's ability to cope with increased load. Sometimes, when discussing scalability, people make comments along the lines of, "You're not Google or Amazon. Stop worrying about scale and just use a relational database." Whether this maxim applies to you depends on the type of application you are building.
 
-If you are building a new product that currently has only a small number of users, perhaps at a startup, the overriding engineering goal is usually to keep the system as simple and flexible as possible so that you can easily modify and adapt the features of your product as you learn more about customers’ needs. In such an environment, it is counterproductive to worry about hypothetical scale that might be needed in the future. In the best case, investments in scalability are wasted effort and premature optimization; in the worst case, they lock you into an inflexible design and make it harder to evolve your application.
+If you are building a new product that currently has only a small number of users, perhaps at a startup, the overriding engineering goal is usually to keep the system as simple and flexible as possible so that you can easily modify and adapt the features of your product as you learn more about customers' needs. In such an environment, it is counterproductive to worry about hypothetical scale that might be needed in the future. In the best case, investments in scalability are wasted effort and premature optimization; in the worst case, they lock you into an inflexible design and make it harder to evolve your application.
 
-**Scalability is not a one-dimensional label** — it is meaningless to say “X is scalable” or “Y doesn’t scale.” Rather, discussing scalability means considering questions like these:
+**Scalability is not a one-dimensional label** — it is meaningless to say "X is scalable" or "Y doesn't scale." Rather, discussing scalability means considering questions like these:
 
 - If the system grows in a particular way, what are our options for coping with the growth?
 - How can we add computing resources to handle the additional load?
 - Based on current growth projections, when will we hit the limits of our current architecture?
 
-If you succeed in making your application popular, and therefore are handling a growing amount of load, you will learn where your performance bottlenecks lie and along which dimensions you need to scale. At that point, it’s time to start worrying about techniques for scalability.
+If you succeed in making your application popular, and therefore are handling a growing amount of load, you will learn where your performance bottlenecks lie and along which dimensions you need to scale. At that point, it's time to start worrying about techniques for scalability.
 
 ### Understanding Load
 
-First, you need a clear understanding of the current load on the system. Only then can you discuss growth questions (“What happens if our load doubles?”). Often this will be a measure of throughput — for example, the number of requests per second to a service, the number of gigabytes of new data arriving per day, or the number of shopping cart checkouts per hour. Sometimes you care about the peak of a variable quantity, such as the number of simultaneously online users in our social network case study.
+First, you need a clear understanding of the current load on the system. Only then can you discuss growth questions ("What happens if our load doubles?"). Often this will be a measure of throughput — for example, the number of requests per second to a service, the number of gigabytes of new data arriving per day, or the number of shopping cart checkouts per hour. Sometimes you care about the peak of a variable quantity, such as the number of simultaneously online users in our social network case study.
 
 Often other statistical characteristics of the load affect the access patterns and hence the scalability requirements. For example, you may need to know the ratio of reads to writes in a database, the hit rate on a cache, or the number of data items per user (followers, in our case study). Perhaps the average case is what matters for you, or perhaps your bottleneck is dominated by a small number of extreme cases. It all depends on the details of your particular application.
 
@@ -961,7 +958,7 @@ Moreover, an architecture that is appropriate for one level of load is unlikely 
 
 A good general principle for scalability is to **break a system into smaller components that can operate largely independently from one another**. This is the underlying principle behind microservices, sharding, stream processing, and shared-nothing architectures. The challenge lies in knowing where to draw the line between things that should be together and things that should be apart.
 
-Another good principle is **not to make things more complicated than necessary**. If a single-machine database will do the job, it’s probably preferable to a complicated distributed setup. Autoscaling systems (which automatically add or remove resources in response to demand) are cool, but if your load is fairly predictable, a manually scaled system may have fewer operational surprises. A system with 5 services is simpler than one with 50. Good architectures usually involve a pragmatic mixture of approaches.
+Another good principle is **not to make things more complicated than necessary**. If a single-machine database will do the job, it's probably preferable to a complicated distributed setup. Autoscaling systems (which automatically add or remove resources in response to demand) are cool, but if your load is fairly predictable, a manually scaled system may have fewer operational surprises. A system with 5 services is simpler than one with 50. Good architectures usually involve a pragmatic mixture of approaches.
 
 ### A pragmatic scaling checklist
 
@@ -996,7 +993,7 @@ graph TB
     style MAINT fill:#FFA500
 ```
 
-Maintenance can be complex, especially for legacy systems. A system that has been successfully running for a long time may well use outdated technologies that not many engineers understand today (such as mainframes and COBOL code), and institutional knowledge of how and why the system was designed in a certain way may have been lost as people have left the organization. Fixing other people’s mistakes might also be necessary. Because computer systems are often intertwined with the human organizations they support, maintenance of such systems is as much a people problem as a technical one.
+Maintenance can be complex, especially for legacy systems. A system that has been successfully running for a long time may well use outdated technologies that not many engineers understand today (such as mainframes and COBOL code), and institutional knowledge of how and why the system was designed in a certain way may have been lost as people have left the organization. Fixing other people's mistakes might also be necessary. Because computer systems are often intertwined with the human organizations they support, maintenance of such systems is as much a people problem as a technical one.
 
 **Every system we create today will one day become a legacy system** if it is valuable enough to survive for a long time. To minimize the pain for future generations who need to maintain our software, we should design it with maintenance in mind. Although we cannot always predict which decisions might create maintenance headaches in the future, in this book we will pay attention to several principles that are widely applicable:
 
@@ -1027,7 +1024,7 @@ graph TB
 
 ### Operability: Making Life Easy for Operations
 
-We previously discussed the role of operations in “Operations in the Cloud Era,” and we saw that human processes are at least as important for reliable operations as software tools. In fact, it has been suggested that “good operations can often work around the limitations of bad (or incomplete) software, but good software cannot run reliably with bad operations.”
+We previously discussed the role of operations in "Operations in the Cloud Era," and we saw that human processes are at least as important for reliable operations as software tools. It has been suggested that "good operations can often work around the limitations of bad (or incomplete) software, but good software cannot run reliably with bad operations."
 
 In large-scale systems consisting of many thousands of machines, manual maintenance would be unreasonably expensive, and automation is essential. However, automation can be a two-edged sword. There will always be edge cases (such as rare failure scenarios) that require manual intervention from the operations team, and since the cases that cannot be handled automatically tend to be the most complex, greater automation requires a more skilled operations team that can resolve those issues.
 
@@ -1035,9 +1032,9 @@ Additionally, an automated system that goes wrong is often harder to troubleshoo
 
 Good operability means making routine tasks easy, allowing the operations team to focus on high-value activities. Data systems can help by doing the following:
 
-- Allowing monitoring tools to check the system’s key metrics and supporting observability tools to give insights into the system’s runtime behavior.
+- Allowing monitoring tools to check the system's key metrics and supporting observability tools to give insights into the system's runtime behavior.
 - Avoiding dependency on individual machines (allowing machines to be taken down for maintenance while the system as a whole continues running uninterrupted).
-- Providing good documentation and an easy-to-understand operational model (“If I do X, Y will happen”).
+- Providing good documentation and an easy-to-understand operational model ("If I do X, Y will happen").
 - Providing good default behavior, but also giving administrators the freedom to override defaults when needed.
 - Self-healing where appropriate, but also giving administrators manual control over the system state when needed.
 - Exhibiting predictable behavior, minimizing surprises.
@@ -1060,7 +1057,7 @@ Abstractions for application code that aim to reduce its complexity can be creat
 
 ### Evolvability: Making Change Easy
 
-It’s extremely unlikely that your system’s requirements will remain unchanged forever. They are much more likely to be in constant flux: you learn new facts, previously unanticipated use cases emerge, business priorities change, users request new features, new platforms replace old platforms, legal or regulatory requirements change, growth of the system forces architectural changes, etc.
+It's extremely unlikely that your system's requirements will remain unchanged forever. They are much more likely to be in constant flux: you learn new facts, previously unanticipated use cases emerge, business priorities change, users request new features, new platforms replace old platforms, legal or regulatory requirements change, growth of the system forces architectural changes, etc.
 
 In terms of organizational processes, Agile working patterns provide a framework for adapting to change. The Agile community has also developed technical tools and processes that are helpful when building software in a frequently changing environment, such as test-driven development (TDD) and refactoring. In this book, we search for ways of increasing agility at the level of a system consisting of several applications or services with different characteristics.
 
@@ -1138,25 +1135,7 @@ We started with a case study of implementing home timelines in a social network,
 
 To achieve reliability, you can use fault-tolerance techniques, which allow a system to continue providing its services even if a component (e.g., a disk, a machine, or another service) is faulty. We saw examples of hardware faults that can occur and distinguished them from software faults, which can be harder to deal with because they are often strongly correlated. Another aspect of achieving reliability is to build resilience against humans making mistakes, and we saw blameless postmortems as a technique for learning from incidents.
 
-Finally, we examined several facets of maintainability, including supporting the work of operations teams, managing complexity, and making it easy to evolve an application’s functionality over time. There are no easy answers to how to achieve these goals, but one approach that can help is to build applications using well-understood building blocks that provide useful abstractions. The rest of this book will cover a selection of building blocks that have proved to be valuable in practice.
-
-```mermaid
-graph TB
-    PERF["Performance<br/>latency, throughput,<br/>percentiles"]
-    REL["Reliability<br/>fault tolerance,<br/>hardware vs software,<br/>human factors"]
-    SCALE["Scalability<br/>load, scaling axes,<br/>shared-nothing"]
-    MAINT["Maintainability<br/>operability, simplicity,<br/>evolvability"]
-
-    PERF --> REL
-    REL --> SCALE
-    SCALE --> MAINT
-    MAINT -.->|"feeds back into<br/>future requirements"| PERF
-
-    style PERF fill:#87CEEB
-    style REL fill:#90EE90
-    style SCALE fill:#DDA0DD
-    style MAINT fill:#ffeb3b
-```
+Finally, we examined several facets of maintainability, including supporting the work of operations teams, managing complexity, and making it easy to evolve an application's functionality over time. There are no easy answers to how to achieve these goals, but one approach that can help is to build applications using well-understood building blocks that provide useful abstractions. The rest of this book will cover a selection of building blocks that have proved to be valuable in practice.
 
 ### Key Takeaways
 
@@ -1184,7 +1163,6 @@ graph TB
 | SLI / SLO / SLA | Indicator (measurement), Objective (target), Agreement (contract) |
 | Fault / Failure | One component breaks / the whole system stops serving users |
 | Single point of failure | A component whose fault becomes a failure |
-| Metastable failure | Overloaded state that doesn't recover when load drops |
 | Retry storm | Clients retrying faster than the server can recover |
 | Circuit breaker | Client-side: fail fast when downstream is known-bad |
 | Load shedding | Server-side: reject requests before you become overloaded |

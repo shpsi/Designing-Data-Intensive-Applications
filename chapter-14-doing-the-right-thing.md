@@ -1,8 +1,18 @@
 # Chapter 14: Doing the Right Thing
 
+## TL;DR
+
+- Data systems make decisions with material effects on people's lives; engineers carry a moral responsibility alongside their technical one.
+- Predictive analytics extrapolate from a biased past; algorithms scale and obscure that bias, demanding audit, recourse, and explainability, not just accuracy.
+- Surveillance infrastructure has transferred privacy decisions from individuals to companies, often without meaningful consent.
+- The GDPR establishes a floor, but regulation alone is insufficient — culture, self-regulation, and minimal data collection matter.
+- Minimize what you collect, scope what you store to a stated purpose, and expire it on a known schedule.
+
+---
+
 This final chapter steps back from the technical details of data systems and asks a different kind of question: **just because we *can* build something, should we?** The book argues that engineers of data-intensive applications carry a moral responsibility, because the systems we design make decisions that profoundly affect people's lives, often invisibly and with little recourse.
 
-> "Just as we look back today at the early decades of the industrial age and wonder how our ancestors could have ignored pollution in their rush to build an industrial world, our grandchildren will look back at us during these early decades of the information age and judge us on how we addressed the challenge of data collection and misuse." — Bruce Schneier
+> "Just as we look back today at the early decades of the industrial age and wonder how our ancestors could have ignored pollution in their rush to build an industrial world, our grandchildren will look back at us during these early decades of the information age and judge us on how we addressed the challenge of data collection and misuse." — Bruce Schneier (cited again in *Remembering the Industrial Revolution*)
 
 Unlike the rest of the book, the concepts here are not fixed or determinate; they require interpretation, which may be subjective. Ethics is not a checklist — it is a participatory and iterative process of reflection, in dialog with the people involved, with accountability for the results.
 
@@ -13,8 +23,6 @@ Unlike the rest of the book, the concepts here are not fixed or determinate; the
 Engineers are accustomed to thinking about correctness, performance, and reliability. Ethics feels like a different discipline entirely. But the systems we build have direct, material consequences for individuals: they decide who gets a loan, who is invited for a job interview, who gets insurance, who is flagged for extra scrutiny by police, and whose voice is amplified or suppressed in public discourse. These are not abstract harms.
 
 **Example: A self-driving car's accident.** When an autonomous vehicle causes a collision, who is responsible? The owner, the manufacturer, the supplier of the perception model, the regulator who approved it? Algorithms make mistakes too, but unlike humans, they cannot be interrogated, held accountable, or asked to explain themselves.
-
-The chapter takes the position that engineers cannot outsource these questions to managers, lawyers, or ethicists. The design choices we make — which features to ship, what data to retain, which metrics to optimize, how to handle edge cases — encode values. If we don't make those values explicit, we cede the decision by default.
 
 ```mermaid
 graph TB
@@ -278,23 +286,7 @@ We will also need to figure out how to realize the positive potential of data an
 
 ## Feedback Loops
 
-Even with predictive applications that have less immediately far-reaching effects on people — such as recommendation systems — there are difficult issues we must confront. When services become good at predicting the content users want to see, they may end up showing people only opinions they already agree with, leading to **echo chambers** in which stereotypes, misinformation, and polarization can breed.
-
-```mermaid
-graph LR
-    A[User behavior<br/>clicks, watch time] --> B[Predictive Model]
-    B --> C[Recommendations /<br/>Ranked Results]
-    C --> D[User sees content]
-    D --> E[User engages further<br/>with same type of content]
-    E --> A
-    style A fill:#87CEEB
-    style B fill:#FFA500
-    style C fill:#DDA0DD
-    style D fill:#87CEEB
-    style E fill:#87CEEB
-```
-
-This is a feedback loop: the system's outputs shape the inputs it later sees. We are already seeing the impact social media echo chambers can have on election campaigns.
+Even with predictive applications that have less immediately far-reaching effects on people — such as recommendation systems — there are difficult issues we must confront. When services become good at predicting the content users want to see, they may end up showing people only opinions they already agree with, leading to **echo chambers** in which stereotypes, misinformation, and polarization can breed. The system's outputs shape the inputs it later sees. We are already seeing the impact social media echo chambers can have on election campaigns.
 
 When predictive analytics affect people's lives, particularly pernicious problems arise because of **self-reinforcing feedback loops**.
 
@@ -328,20 +320,6 @@ Economists studying the German retail gasoline market found that when gas statio
 ### Example: predictive policing
 
 Predictive policing systems assign officers to areas predicted by the model to have high crime rates. If officers spend more time in those areas, they will naturally make more arrests there. Those arrests feed back into the training data, which confirms (and amplifies) the model's prediction. The result is that policing becomes concentrated in already-policed neighborhoods — typically poor and minority neighborhoods — regardless of where crime actually occurs.
-
-```mermaid
-graph LR
-    A[Historical<br/>arrest data] --> B[Predictive<br/>policing model]
-    B --> C[Predicted<br/>hotspots]
-    C --> D[Officers dispatched<br/>to hotspots]
-    D --> E[More arrests<br/>in hotspots]
-    E --> A
-    style A fill:#87CEEB
-    style B fill:#FFA500
-    style C fill:#DDA0DD
-    style D fill:#87CEEB
-    style E fill:#ffcccc
-```
 
 ### Systems thinking
 
@@ -529,9 +507,9 @@ The right to privacy is a **decision right**: it enables each person to decide w
 
 For example, someone who suffers from a rare medical condition might be very happy to provide their private medical data to researchers if it might help the development of treatments. However, this person must have a choice over who may access this data and for what purpose. If information about their condition could hinder their access to medical insurance or employment, they would probably be much more cautious about sharing their data.
 
-### The transferred-privacy model
+### How privacy slips away from the individual
 
-When data is extracted from people through surveillance infrastructure, privacy rights are not necessarily eroded but rather **transferred to the data collector**. Companies that acquire data essentially say, "Trust us to do the right thing with your data," which means that the right to decide what to reveal and what to keep secret is transferred from the individual to the company.
+When data is extracted from people through surveillance infrastructure, privacy rights are not necessarily eroded but rather **transferred to the data collector**. Companies that acquire data say, "Trust us to do the right thing with your data," which means that the right to decide what to reveal and what to keep secret is transferred from the individual to the company.
 
 ```mermaid
 graph LR
@@ -550,13 +528,9 @@ The companies in turn choose to keep much of the outcome of this surveillance se
 
 Even if particular users cannot be personally reidentified from the bucket of people targeted by a particular ad, they have lost their agency about the disclosure of some intimate information. It is not the user who decides what is revealed to whom on the basis of their personal preferences — it is the company that exercises the privacy right with the goal of maximizing its profit.
 
-### The creepiness filter
-
 Many companies want to avoid being perceived as creepy, avoiding the question of how intrusive their data collection actually is and instead focusing on managing user perceptions. And even these perceptions are often managed poorly — for example, something may be factually correct, but if it triggers painful memories, the user may not want to be reminded about it [35].
 
 With any kind of data, we should expect the possibility that it is wrong, undesirable, or inappropriate in some way, and we need to build mechanisms for handling those failures. Whether something is "undesirable" or "inappropriate" is of course down to human judgment; algorithms are oblivious to such notions unless we explicitly program them to respect human needs. As engineers of these systems, we must be humble, accepting and planning for such failings.
-
-### Privacy settings: necessary but insufficient
 
 Privacy settings that allow a user of an online service to control which aspects of their data other users can see are a starting point for handing back some control to users. However, regardless of the setting, the service itself still has unfettered access to the data and is free to use it in any way permitted by the privacy policy. Even if the service promises not to sell the data to third parties, it usually grants itself unrestricted rights to process and analyze the data internally, often going much further than what is overtly visible to users.
 
@@ -566,14 +540,12 @@ This kind of large-scale transfer of privacy rights from individuals to corporat
 
 Where privacy is genuinely required, the field has developed several techniques worth knowing about. Each makes a different trade-off between utility, privacy, and computational cost.
 
-| Technique | Idea | Limitation |
-|---|---|---|
-| **k-anonymity** | Generalize or suppress fields so each record is indistinguishable from at least `k-1` others | Vulnerable to background-knowledge attacks; loses utility |
-| **l-diversity** | Each equivalence class must contain at least `l` diverse values of the sensitive attribute | Still vulnerable to skewness and similarity attacks |
-| **Differential privacy** | Add calibrated noise to query results so the inclusion/exclusion of any one person has bounded effect | Requires careful calibration; degrades small-query accuracy |
-| **Homomorphic encryption** | Compute on encrypted data without decrypting | Extremely expensive; limited operation set |
-| **Federated learning** | Train models on user devices; share only gradients | Gradients can leak training data (gradient inversion attacks) |
-| **Secure enclaves (TEE)** | Compute on plaintext inside hardware-isolated enclaves | Trust shifts to hardware vendor; side-channel attacks |
+| Approach | Techniques | Idea | Limitation |
+|---|---|---|---|
+| **Anonymization** | k-anonymity, l-diversity | Generalize or suppress fields so each record is indistinguishable from a group of others | Vulnerable to background-knowledge and skewness attacks; loses utility |
+| **Statistical noise** | Differential privacy | Add calibrated noise to query results so inclusion/exclusion of any one person has bounded effect | Requires careful calibration; degrades small-query accuracy |
+| **Cryptographic isolation** | Homomorphic encryption, Federated learning | Compute on encrypted data (HE) or train on user devices with only gradients shared (FL) | Extremely expensive compute (HE); gradients can leak training data (FL) |
+| **Hardware isolation** | Secure enclaves (TEE) | Compute on plaintext inside hardware-isolated enclaves | Trust shifts to hardware vendor; side-channel attacks |
 
 The chapter does not endorse any single technique as a silver bullet. The right approach is to use the *minimum* amount of data needed for the task, *minimize* retention, and *architect* the system so that less-trusted components see less data.
 
@@ -673,7 +645,7 @@ It took a long time before safeguards were established, such as environmental pr
 
 ### The pollution parallel
 
-Just as the Industrial Revolution had a dark side that needed to be managed, our transition to the information age has major problems that we need to confront and solve [43, 44]. The collection and use of data is one of those problems. In the words of Bruce Schneier [26]:
+Just as the industrial revolution had a dark side that needed to be managed, our transition to the information age has major problems that we need to confront and solve [43, 44]. The collection and use of data is one of those problems. In the words of Bruce Schneier [26]:
 
 > Data is the pollution problem of the information age, and protecting privacy is the environmental challenge. Almost all computers produce information. It stays around, festering. How we deal with it — how we contain it and how we dispose of it — is central to the health of our information economy. Just as we look back today at the early decades of the industrial age and wonder how our ancestors could have ignored pollution in their rush to build an industrial world, our grandchildren will look back at us during these early decades of the information age and judge us on how we addressed the challenge of data collection and misuse.
 
@@ -685,7 +657,7 @@ This framing is powerful because it suggests that the right response is not to a
 
 ## Legislation and Self-Regulation
 
-Data protection laws might be able to help preserve individuals' rights. For example, the GDPR states that personal data must be **"collected for specified, explicit and legitimate purposes and not further processed in a manner that is incompatible with those purposes"** and be **"adequate, relevant and limited to what is necessary in relation to the purposes for which [it is] processed"** [32].
+Data protection laws might be able to help preserve individuals' rights. For example, the GDPR states that personal data must be **"collected for specified, explicit and legitimate purposes and not further processed in a manner that is incompatible with those purposes"** and be **"adequate, relevant and limited to what is necessary in relation to the purposes for which [it is] processed"** [32]. See the *Principles vs. Practice* table at the end of this chapter for how these principles stack up against current industry practice.
 
 However, this principle of **data minimization** runs directly counter to the philosophy of big data, which is to maximize data collection, to combine the collected data with other datasets, and to experiment and explore in order to generate new insights. Exploration means using data for unforeseen purposes, which the GDPR states is the opposite of the "specified and explicit" purposes for which the data must have been collected.
 
@@ -865,104 +837,46 @@ This brings us to the end of the book. We have covered a lot of ground:
 
 Finally, in this last chapter, we took a step back and examined some ethical aspects of building data-intensive applications. We saw that although data can be used to do good, it can also do significant harm: making decisions that seriously affect people's lives and are difficult to appeal against, leading to discrimination and exploitation, normalizing surveillance, and exposing intimate information. We also run the risk of data breaches, and we may find that a well-intentioned use of data has unintended consequences.
 
-```mermaid
-graph TB
-    subgraph "The Engineer's Responsibilities"
-        R1["Build systems that<br/>respect human dignity"]
-        R2["Measure and mitigate<br/>disparate impact"]
-        R3["Minimize and<br/>expire data"]
-        R4["Preserve auditability<br/>and recourse"]
-        R5["Push back on<br/>creepiness / harm"]
-        R6["Educate users, peers,<br/>and the public"]
-    end
-    R1 --> R7["Trust"]
-    R2 --> R7
-    R3 --> R7
-    R4 --> R7
-    R5 --> R7
-    R6 --> R7
-    R7 --> R8["A world that treats<br/>people with humanity<br/>and respect"]
-    style R1 fill:#90EE90
-    style R2 fill:#90EE90
-    style R3 fill:#90EE90
-    style R4 fill:#90EE90
-    style R5 fill:#FFD700
-    style R6 fill:#FFD700
-    style R7 fill:#FFD700
-    style R8 fill:#90EE90
-```
+### Key Takeaways
 
-Given the large impact that software and data have on the world, we as engineers must remember that we carry a responsibility to work toward the kind of world that we want to live in: a world that treats people with humanity and respect. **Let's work together toward that goal.**
+1. **Predictive analytics extrapolate from the past.** If the past is discriminatory, the model will codify and amplify it. Moral imagination, not bigger models, is what changes outcomes.
 
----
+2. **Feedback loops are everywhere.** Recommendation systems, predictive policing, credit scoring, and pricing algorithms all create self-reinforcing dynamics. Reason about the *system*, not just the model.
 
-## Key Takeaways
+3. **Surveillance is the natural endpoint of "data exhaust" thinking.** Naming the practice honestly is the first step toward changing it.
 
-1. **Predictive analytics extrapolate from the past.** If the past is discriminatory, the model will codify and amplify it. Moral imagination — not bigger models — is what changes outcomes.
+4. **Consent in the GDPR sense is rarely what users actually experience.** The legal text and the lived UX of a 5,000-word ToS are very different things. Don't conflate them.
 
-2. **Algorithms do not absolve humans of responsibility.** When an algorithm makes a mistake, someone must be accountable, the decision must be explainable, and the affected person must have a path to recourse.
-
-3. **Feedback loops are everywhere.** Recommendation systems, predictive policing, credit scoring, and pricing algorithms all create self-reinforcing dynamics. Reason about the *system*, not just the model.
-
-4. **Surveillance is the natural endpoint of "data exhaust" thinking.** Naming the practice honestly is the first step toward changing it.
-
-5. **Consent in the GDPR sense is rarely what users actually experience.** The legal text and the lived UX of a 5,000-word ToS are very different things. Don't conflate them.
-
-6. **Data is a toxic asset.** Minimize collection, minimize retention, and prefer architectures where less-trusted components see less data.
-
-7. **Regulation alone is insufficient.** A culture shift in how engineering teams treat personal data is required. Self-regulation, peer accountability, and education matter as much as the law.
-
-8. **The Industrial Revolution took generations to regulate. We have less time.** Build the safeguards now, not after the harm is done.
-
-9. **Reason about the system, not just the model.** Your model's accuracy on a held-out test set tells you almost nothing about whether deploying it makes the world better or worse.
-
-10. **"Move fast and break things" is not a moral position.** When the things being broken are people's lives, liberties, and dignity, the speed of iteration is a cost, not a benefit.
+5. **Data is a toxic asset — minimize, scope, and expire it.** Collect the minimum, scope every field to an allowed purpose, and let records expire on a known schedule. Data you don't have can't be leaked, stolen, or compelled.
 
 ### A short checklist for code review
 
 When reviewing a pull request that touches data collection, model training, or user-facing decisions, the following questions are useful. They are not exhaustive, but they surface issues that are otherwise easy to miss in review.
 
-```mermaid
-graph TB
-    Q1["Where does this<br/>data come from?"] --> Q1a["Did the user know?<br/>Did they consent?"]
-    Q2["How long do we<br/>keep it?"] --> Q2a["Is there an expiration?<br/>Is it enforced?"]
-    Q3["Who can see it?"] --> Q3a["Least-privilege?<br/>Logged access?"]
-    Q4["What decisions<br/>does it drive?"] --> Q4a["Reversible?<br/>Explainable?<br/>Appeallable?"]
-    Q5["Who is harmed<br/>if it's wrong?"] --> Q5a["Worst case?<br/>Affected groups?"]
-    Q6["How do we delete it?"] --> Q6a["Tested? Cascades?"]
-    style Q1 fill:#FFD700
-    style Q2 fill:#FFD700
-    style Q3 fill:#FFD700
-    style Q4 fill:#FFD700
-    style Q5 fill:#FFD700
-    style Q6 fill:#FFD700
-    style Q1a fill:#87CEEB
-    style Q2a fill:#87CEEB
-    style Q3a fill:#87CEEB
-    style Q4a fill:#87CEEB
-    style Q5a fill:#87CEEB
-    style Q6a fill:#87CEEB
-```
+| Question | Probe |
+|---|---|
+| Where does this data come from? | Did the user know? Did they consent? |
+| How long do we keep it? | Is there an expiration? Is it enforced? |
+| Who can see it? | Least-privilege? Logged access? |
+| What decisions does it drive? | Reversible? Explainable? Appeallable? |
+| Who is harmed if it's wrong? | Worst case? Affected groups? |
+| How do we delete it? | Tested? Cascades? |
 
 If your team can't answer one of these for a piece of data in production, that gap is worth raising before the change ships — not after a regulator, a journalist, or a user notices.
 
----
+### A note on moral imagination
 
-## An Afterword in Three Sentences
+No checklist, regulation, or technical technique can substitute for **moral imagination**: the willingness to look at a system and ask, "Is this the world I want to live in? Would I want to be on the receiving end of this decision? Would I be comfortable if this practice were described on the front page of a newspaper?" If the answer is no, the appropriate response is not to find a clever workaround but to redesign the system. That is the work, and it is unfinished.
+
+### Afterword
 
 Most of this book has been about how to build data systems that work. This chapter has been about how to ensure that the systems we build are *worth* working — that they serve human flourishing rather than merely corporate optimization, that they distribute benefit rather than concentrating harm, and that they leave room for the kind of society we want our children to inherit. The technical questions are easier than the moral ones, but the moral ones are the ones we will be judged on.
 
 Build well. Build carefully. Build for people.
 
----
+Given the large impact that software and data have on the world, we as engineers must remember that we carry a responsibility to work toward the kind of world that we want to live in: a world that treats people with humanity and respect. **Let's work together toward that goal.**
 
-## A Note on Moral Imagination
-
-The closing argument of the chapter is that no checklist, regulation, or technical technique can substitute for **moral imagination**: the willingness to look at a system and ask, "Is this the world I want to live in? Would I want to be on the receiving end of this decision? Would I be comfortable if this practice were described on the front page of a newspaper?" If the answer is no, the appropriate response is not to find a clever workaround but to redesign the system. That is the work, and it is unfinished.
-
----
-
-## Further Reading
+### Further reading
 
 The chapter cites work from several authors whose books are worth reading in full:
 
@@ -974,9 +888,9 @@ The chapter cites work from several authors whose books are worth reading in ful
 
 The ACM Code of Ethics (2018) is also worth re-reading periodically; it is shorter than you remember and stricter than you expect.
 
----
+### References (as cited in the chapter)
 
-## References (as cited in the chapter)
+_Numbers match the source book; gaps reflect citations reused only in the original print edition._
 
 - [1] David Schmudde. "What If Data Is a Bad Idea?" *schmud.de*, August 2024.
 - [2] Association for Computing Machinery. "ACM Code of Ethics and Professional Conduct." *acm.org*, 2018.

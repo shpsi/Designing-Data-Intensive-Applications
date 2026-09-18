@@ -1,5 +1,15 @@
 # Chapter 10: Consistency and Consensus
 
+## TL;DR
+
+- **Linearizability** is a precise recency guarantee on reads/writes of a single object: once a write completes, all later reads must see it. It is stronger than serializability only along the real-time axis.
+- **Logical clocks** (Lamport, hybrid, vector) order events consistent with causality; they do not guarantee linearizability. A single-node autoincrementing ID generator is linearizable; distributed ID generators usually sacrifice ordering.
+- **Consensus** = getting multiple nodes to agree on a value in a fault-tolerant way. Single-value consensus, linearizable CAS, shared logs (total order broadcast), atomic commit, and linearizable fetch-and-add are all equivalent — solving one solves them all.
+- **Consensus algorithms** (Raft, Paxos, Zab, Viewstamped Replication) implement the shared-log abstraction, which is the canonical home for fencing tokens, distributed locks, and leases. Coordination services like ZooKeeper and etcd package these primitives for application use.
+- **Cost:** consensus requires a strict majority, adds latency proportional to network delay uncertainty, and is impractical for high-throughput data. When you need it, use a coordination service rather than implementing it yourself.
+
+---
+
 ## Introduction
 
 In the previous chapters we explored replication, partitioning, transactions, and the problems of distributed systems. We now turn to the most subtle and powerful abstraction in distributed computing: **consensus** — and its close cousin, **linearizability**.
@@ -50,9 +60,9 @@ We will stick with informal intuitions and avoid the algorithmic nitty-gritty, f
 
 If you want a replicated database to be as simple as possible to use, you should make it behave as if it were a consistent single-node database. Then users don't have to worry about replication lag, conflicts, and other inconsistencies; you get the advantage of fault tolerance but without the complexity of having to think about multiple replicas.
 
-This is the idea behind **linearizability** [1] (also known as atomic consistency, strong consistency, immediate consistency, or external consistency). The exact definition is quite subtle, but the basic idea is to make a system appear as if there is only one copy of the data, and all operations on it are atomic. With this guarantee, even though there may be multiple replicas in reality, the application does not need to worry about them.
+This is the idea behind **linearizability** [Herlihy & Wing, 1990] (also known as atomic consistency, strong consistency, immediate consistency, or external consistency). The exact definition is quite subtle, but the basic idea is to make a system appear as if there is only one copy of the data, and all operations on it are atomic. With this guarantee, even though there may be multiple replicas in reality, the application does not need to worry about them.
 
-In a linearizable system, as soon as one client successfully completes a write, all clients reading from the database must be able to see the value just written. Maintaining the illusion of a single copy of the data means guaranteeing that the value read is the most recent, up-to-date value and doesn't come from a stale cache or replica. In other words, **linearizability is a recency guarantee**.
+In a linearizable system, as soon as one client successfully completes a write, all clients reading from the database must be able to see the value just written. Maintaining the illusion of a single copy of the data means guaranteeing that the value read is the most recent, up-to-date value and doesn't come from a stale cache or replica. **Linearizability is a recency guarantee.**
 
 ### A Nonlinearizable Sports Website
 
@@ -181,20 +191,10 @@ The interesting details:
 
 ### Linearizability Versus Serializability
 
-These two terms are easily confused, but they are quite different guarantees:
+These two terms are easily confused; for full definitions of serializability see Chapter 8. In short:
 
-**Serializability**:
-- An **isolation level** of transactions.
-- Every transaction may read and write multiple objects (rows, documents, records).
-- Guarantees that transactions behave the same as if they had executed in some serial order.
-- It is OK for that serial order to be different from the order in which the transactions were actually run.
-
-**Linearizability**:
-- A guarantee on reads and writes of a **register** (an individual object).
-- Does not group operations together into transactions.
-- Does not prevent problems such as write skew that involve multiple objects.
-- Is a **recency guarantee**: if one operation finishes before another one starts, the later operation must observe a state that is at least as new as the earlier operation.
-- Serializability does not have that requirement — for example, stale reads are allowed by serializability.
+- **Serializability** is a transaction **isolation** guarantee: transactions behave as if executed in some serial order. Stale reads are permitted within that order.
+- **Linearizability** is a **recency** guarantee on reads/writes of a single register: if op1 completes before op2 starts, op2 must see the effect of op1. Serializability has no such requirement.
 
 | Aspect | Linearizability | Serializability |
 |--------|-----------------|-----------------|
@@ -234,7 +234,7 @@ graph TB
     style SS fill:#90EE90
 ```
 
-It is also possible to combine a weaker isolation level with linearizability, or a weaker consistency model with serializability; in fact, the consistency model and isolation level can be chosen largely independently.
+It is also possible to combine a weaker isolation level with linearizability, or a weaker consistency model with serializability; the consistency model and isolation level can be chosen largely independently.
 
 ---
 
@@ -297,7 +297,7 @@ Linearizability is not the only way of avoiding this race condition, but it is t
 
 ### Implementing Linearizable Systems
 
-Since linearizability essentially means "behave as though there is only a single copy of the data, and all operations on it are atomic," the simplest answer would be to really use only a single copy of the data. However, that approach would not be able to tolerate faults: if the node holding that one copy failed, the data would be lost, or at least inaccessible until the node was brought up again.
+Since linearizability means "behave as though there is only a single copy of the data, and all operations on it are atomic," the simplest answer would be to really use only a single copy of the data. However, that approach would not be able to tolerate faults: if the node holding that one copy failed, the data would be lost, or at least inaccessible until the node was brought up again.
 
 Let's revisit the replication methods from Chapter 6 and see whether they can be made linearizable:
 
@@ -316,7 +316,7 @@ Sharding a single-leader database, with a separate leader per shard, does not af
 
 #### Consensus Algorithms (Likely Linearizable)
 
-Some consensus algorithms are essentially single-leader replication with automatic leader election and failover. They are carefully designed to prevent split brain, allowing them to implement linearizable storage safely. ZooKeeper uses the Zab consensus algorithm, and etcd uses Raft. However, just because a system uses consensus does not guarantee that all operations on it are linearizable. If it allows reads on a node without checking that it is still the leader, the results of the read may be stale if a new leader has just been elected.
+Some consensus algorithms are single-leader replication with automatic leader election and failover. They are carefully designed to prevent split brain, allowing them to implement linearizable storage safely. ZooKeeper uses the Zab consensus algorithm, and etcd uses Raft. However, just because a system uses consensus does not guarantee that all operations on it are linearizable. If it allows reads on a node without checking that it is still the leader, the results of the read may be stale if a new leader has just been elected.
 
 #### Multi-Leader Replication (Not Linearizable)
 
@@ -449,7 +449,7 @@ Although linearizability is a useful guarantee, surprisingly few systems are lin
 
 The reason for this behavior is that every CPU core has its own memory cache and store buffer. Reads are served from the cache by default, and any changes are asynchronously written out to main memory. Since accessing data in the cache is much faster than going to main memory, this feature is essential for good performance on modern CPUs. However, it means there are now multiple copies of the data (one in main memory, and perhaps several more in various caches), and these copies are asynchronously updated, so linearizability is lost.
 
-Why make this trade-off? It makes no sense to use the CAP theorem to justify the multi-core memory consistency model. Within one computer we usually assume reliable communication, and we don't expect one CPU core to be able to continue operating normally if it is disconnected from the rest of the computer. **The reason for dropping linearizability is performance, not fault tolerance**.
+Why make this trade-off? It makes no sense to use the CAP theorem to justify the multi-core memory consistency model. Within one computer we usually assume reliable communication, and we don't expect one CPU core to be able to continue operating normally if it is disconnected from the rest of the computer. **The reason for dropping linearizability is performance, not fault tolerance.**
 
 The same is true of many distributed databases that choose not to provide linearizable guarantees: they do so primarily to increase performance, not so much for fault tolerance. **Linearizable systems tend to be higher latency — and this is true all the time, not only during a network fault.**
 
@@ -522,79 +522,37 @@ The real problems are:
 
 You can consider various alternative options:
 
+| Scheme | Unique? | Ordered by creation? | Distributed? | Fault-tolerant? |
+|--------|---------|----------------------|--------------|-----------------|
+| **Single-node autoincrement** (linearizable) | ✓ | ✓ strict | ✗ | ✗ |
+| **Sharded (even/odd bits)** | ✓ | ✗ | ✓ | ✓ |
+| **Preallocated blocks** | ✓ | ✗ (across blocks) | ✓ | ✓ |
+| **Random UUIDs (v4)** | ✓ (~probabilistic) | ✗ | ✓ | ✓ |
+| **Wall-clock + bits** (Snowflake, ULID, v7 UUID) | ✓ | ~approximate | ✓ | ✓ |
+| **Lamport / hybrid logical clock** | ✓ | ✓ (consistent with causality) | ✓ | ✓ |
+
+The rest of this section examines each scheme in turn.
+
 **Sharded ID Assignment**: You could have multiple nodes that assign IDs — for example, one that generates only even numbers and one that generates only odd numbers. In general, you can reserve some bits in the ID to contain a shard number. Those IDs are still compact, but **you lose the ordering property** — for example, if you have chat messages with IDs 16 and 17, you don't know whether message 16 was actually sent first, because the IDs were assigned by different nodes, and one node might have been ahead of the other.
 
 **Preallocated Blocks of IDs**: Instead of individual IDs, the single-node ID generator could hand out blocks of IDs. For example, node A might claim the block of IDs from 1 to 1,000, and node B might claim the block from 1,001 to 2,000. Then each node can independently hand out IDs from its block, and request a new block from the ID generator when its supply begins to run low. However, this scheme **doesn't ensure correct ordering either** — it could happen that one message is given an ID in the range 1,001-2,000 and a later message is given an ID in the range 1-1,000 if the ID was assigned by a different node.
 
-**Random UUIDs**: Universally unique identifiers (UUIDs), also known as globally unique identifiers (GUIDs), have the big advantage that they can be generated locally on any node without requiring communication, but they require more space (**128 bits**). UUIDs have several versions; the simplest is version 4, which is essentially a random number that is so long that it is very unlikely that two nodes would ever pick the same one. Unfortunately, the order of such IDs is also random, so comparing two IDs tells you nothing about which one is newer.
+**Random UUIDs**: Universally unique identifiers (UUIDs), also known as globally unique identifiers (GUIDs), have the big advantage that they can be generated locally on any node without requiring communication, but they require more space (**128 bits**). UUIDs have several versions; the simplest is version 4, which is a random number that is so long that it is very unlikely that two nodes would ever pick the same one. Unfortunately, the order of such IDs is also random, so comparing two IDs tells you nothing about which one is newer.
 
 **Wall-Clock Timestamp Made Unique**: If your nodes' time-of-day clocks are kept approximately correct using NTP, you can generate IDs by putting a timestamp from this clock in the most significant bits and filling the remaining bits with extra information that ensures the ID is unique even if the timestamp is not — for example, a shard number and a per-shard incrementing sequence number, or a long random value. This approach is used in:
 
-- **Version 7 UUIDs** [52]
-- **X's Snowflake** [53]
-- **ULIDs** [54]
+- **Version 7 UUIDs** [Davis et al., 2024]
+- **X's Snowflake** [King, 2010]
+- **ULIDs**
 - **Hazelcast's Flake ID generator**
 - **MongoDB ObjectIDs**
 - **Many similar schemes**
 
 All these schemes generate IDs that are unique (at least with high enough probability that collisions are vanishingly rare), but they have much weaker ordering guarantees for IDs than the single-node autoincrementing scheme.
 
-```mermaid
-graph TB
-    subgraph "ID Generation Schemes"
-        A["Single-node<br/>autoincrementing<br/>(linearizable)"]
-        B["Sharded<br/>(even/odd bits)"]
-        C["Preallocated<br/>blocks"]
-        D["Random UUIDs<br/>(v4)"]
-        E["Wall-clock + bits<br/>(Snowflake, ULID, v7 UUID)"]
-        F["Lamport /<br/>hybrid logical clock"]
-    end
-
-    subgraph "Properties"
-        P1["Unique?"]
-        P2["Ordered<br/>by creation?"]
-        P3["Distributed?"]
-        P4["Fault-tolerant?"]
-    end
-
-    A --> P1
-    A --> P2
-    A -.->|✗| P3
-    A -.->|✗| P4
-
-    B --> P1
-    B -.->|✗| P2
-    B --> P3
-    B --> P4
-
-    C --> P1
-    C -.->|✗| P2
-    C --> P3
-    C --> P4
-
-    D --> P1
-    D -.->|✗| P2
-    D --> P3
-    D --> P4
-
-    E --> P1
-    E -.->|~approximate| P2
-    E --> P3
-    E --> P4
-
-    F --> P1
-    F --> P2
-    F --> P3
-    F --> P4
-
-    style A fill:#90EE90
-    style F fill:#90EE90
-    style D fill:#ffcccc
-```
-
 ### Wall-Clock Timestamps: A Subtle Problem
 
-As discussed earlier, wall-clock timestamps can provide at best an approximate ordering. If an earlier write gets a timestamp from a slightly fast clock and a later write's timestamp is from a slightly slow clock, the timestamp order may be inconsistent with the order in which the events actually happened. With clock jumps due to using a nonmonotonic clock, even the timestamps generated by a single node might be ordered incorrectly. **ID generators based on wall-clock time are therefore unlikely to be linearizable.**
+Wall-clock timestamps can provide at best an approximate ordering. If an earlier write gets a timestamp from a slightly fast clock and a later write's timestamp is from a slightly slow clock, the timestamp order may be inconsistent with the order in which the events actually happened. With clock jumps due to using a nonmonotonic clock, even the timestamps generated by a single node might be ordered incorrectly. **ID generators based on wall-clock time are therefore unlikely to be linearizable.**
 
 You can reduce such ordering inconsistencies by relying on high-precision clock synchronization, using atomic clocks or GPS receivers. But it would also be nice to be able to generate IDs that are unique and correctly ordered without relying on special hardware. Next, we'll look at a type of clock that enables just that.
 
@@ -630,9 +588,9 @@ graph LR
 
 #### Lamport Timestamps
 
-A simple method for generating logical timestamps that is consistent with causality is the **Lamport clock**, proposed in 1978 by Leslie Lamport [56], in what is now one of the most-cited papers in the field of distributed systems.
+A simple method for generating logical timestamps that is consistent with causality is the **Lamport clock**, proposed in 1978 by Leslie Lamport [Lamport, 1978], in what is now one of the most-cited papers in the field of distributed systems.
 
-Each node has a unique identifier (which in practice could be a random UUID). Each node also keeps a count of the operations it has processed. A Lamport timestamp is then simply a pair of `(counter, node ID)`. Two nodes may sometimes have the same counter value, but by including the node ID in the timestamp, each timestamp is made unique.
+Each node has a unique identifier (which in practice could be a random UUID). Each node also keeps a count of the operations it has processed. A Lamport timestamp is then a pair of `(counter, node ID)`. Two nodes may sometimes have the same counter value, but by including the node ID in the timestamp, each timestamp is made unique.
 
 ```mermaid
 sequenceDiagram
@@ -741,38 +699,21 @@ Every time a timestamp from a hybrid logical clock is generated, it is also incr
 
 As a result, you can treat a timestamp from a hybrid logical clock almost like a timestamp from a conventional time-of-day clock, with the added property that its ordering is consistent with the happens-before relation. It doesn't depend on any special hardware and requires only roughly synchronized clocks. **Hybrid logical clocks are used by CockroachDB**, for example.
 
-```mermaid
-graph TB
-    subgraph "Lamport Clock"
-        L1["Compact: (counter, node_id)"]
-        L2["Total order, consistent with causality"]
-        L3["✗ No relation to physical time"]
-        L4["✗ Counters diverge if nodes don't talk"]
-    end
-
-    subgraph "Hybrid Logical Clock"
-        H1["Compact: ~physical timestamp + node"]
-        H2["Total order, consistent with causality"]
-        H3["✓ Roughly tracks physical time"]
-        H4["✓ Counters converge across nodes"]
-        H5["✓ Monotonic even if physical clock jumps"]
-    end
-
-    L1 -.->|"improves"| H1
-    L2 -.->|"keeps"| H2
-    L3 -.->|"fixes"| H3
-    L4 -.->|"fixes"| H4
-
-    style H5 fill:#90EE90
-```
-
 #### Lamport/Hybrid Logical Clocks Versus Vector Clocks
 
-In Chapter 8 we discussed how snapshot isolation is often implemented: essentially, by giving each transaction a transaction ID, and allowing each transaction to see writes made by transactions with a lower ID but making writes by transactions with higher IDs invisible. **Lamport clocks and hybrid logical clocks are a good way of generating these transaction IDs** because they ensure that the snapshot is consistent with causality.
+In Chapter 8 we discussed how snapshot isolation is often implemented: by giving each transaction a transaction ID, and allowing each transaction to see writes made by transactions with a lower ID but making writes by transactions with higher IDs invisible. **Lamport clocks and hybrid logical clocks are a good way of generating these transaction IDs** because they ensure that the snapshot is consistent with causality.
 
 When multiple timestamps are generated concurrently, these algorithms order them arbitrarily. This means that when you look at two timestamps, you generally can't tell whether they were generated concurrently or one happened before the other. (In the chat example, you actually can tell that Aaliyah and Caleb's messages must have been concurrent, because they have the same counter value; however, when the counter values are different, you can't tell whether they were concurrent.)
 
 If you want to be able to determine when records were created concurrently, you need a different algorithm, such as a **vector clock**. Vector clocks keep a counter for each node and store all the counter values with each write. If write A has a higher counter value than B for one node, and write B has a higher counter value than A for another node, then A and B must be concurrent. The downside is that the timestamps from a vector clock take up much more space than the other timestamps we have discussed — potentially one integer for every node in the system.
+
+| Property | Lamport / Hybrid Logical | Vector |
+|----------|--------------------------|--------|
+| Compact (a few bytes) | ✓ | ✗ — one counter per node |
+| Total order | ✓ | ✗ — partial order |
+| Consistent with causality | ✓ | ✓ |
+| Detects concurrent events | ✗ (only when counters tie) | ✓ |
+| No special hardware | ✓ | ✓ |
 
 ```python
 class VectorClock:
@@ -860,7 +801,7 @@ graph LR
 
 ### Linearizable ID Generators
 
-Although Lamport clocks and hybrid logical clocks provide useful ordering guarantees, that ordering is still **weaker than the linearizable single-node ID generator**. Recall that linearizability requires that if request A completed before request B began, then B must have the higher ID, even if A and B never communicated with each other. On the other hand, Lamport clocks can ensure only that a node generates timestamps that are greater than any other timestamp that node has seen; no such guarantees can be made about timestamps that it hasn't seen.
+Lamport clocks and hybrid logical clocks provide useful ordering guarantees, but that ordering is still **weaker than the linearizable single-node ID generator**. Recall that linearizability requires that if request A completed before request B began, then B must have the higher ID, even if A and B never communicated with each other. On the other hand, Lamport clocks can ensure only that a node generates timestamps that are greater than any other timestamp that node has seen; no such guarantees can be made about timestamps that it hasn't seen.
 
 **Example**: Imagine a social media website where user A wants to share an embarrassing photo privately with their friends. User A's account is initially public, but using their laptop, they change their account settings to private. They then use their phone to upload the photo. Since user A performed these updates in sequence, they might reasonably expect the photo upload to be subject to the new, restricted account permissions. However, this is not necessarily the case.
 
@@ -898,15 +839,13 @@ Now, suppose that a viewer (who is not friends with A) is looking at A's profile
 
 You can imagine several possible ways of fixing this problem. Maybe the photos database should have read the user's account status before performing the write, but it's easy to forget such a check. The simplest solution in this case would be to use a **linearizable ID generator**, which would ensure that the photo upload is assigned a greater ID than the account permissions change.
 
-#### Implementing a Linearizable ID Generator
-
 The simplest way of ensuring that ID assignment is linearizable is by **actually using a single node** for this purpose. That node needs to do only three things:
 
 1. Atomically increment a counter and return its value when requested.
 2. Persist the counter value (so that it doesn't generate duplicate IDs if the node crashes and restarts).
 3. Replicate it for fault tolerance (using single-leader replication).
 
-This approach is used in practice — for example, TiDB/TiKV calls it a **timestamp oracle**, inspired by Google's Percolator [59].
+This approach is used in practice — for example, TiDB/TiKV calls it a **timestamp oracle**, inspired by Google's Percolator [Peng & Dabek, 2010].
 
 As an optimization, you can avoid performing a disk write and replication on every single request. Instead, the ID generator can write a record describing a batch of IDs; once that record is persisted and replicated, the node can start handing out those IDs to clients in sequence. Before it runs out of IDs in that batch, it can persist and replicate the record for the next batch. That way, some IDs will be skipped if the node crashes and restarts or if you fail over to a follower, but you won't issue any duplicate or out-of-order IDs.
 
@@ -1009,14 +948,14 @@ graph TB
     style D3 fill:#ffcccc
 ```
 
-It turns out that all of these are instances of the same fundamental distributed systems problem: **consensus**. The standard formulation of consensus involves getting multiple nodes to agree on a single value. It is one of the most important and fundamental problems in distributed computing; it is also infamously difficult to get right [60, 61], and many systems have gotten it wrong in the past.
+It turns out that all of these are instances of the same fundamental distributed systems problem: **consensus**. The standard formulation of consensus involves getting multiple nodes to agree on a single value. It is one of the most important and fundamental problems in distributed computing; it is also infamously difficult to get right [Lamport, 2001; Ongaro & Ousterhout, 2014], and many systems have gotten it wrong in the past.
 
 The best-known consensus algorithms are:
 
-- **Viewstamped Replication** [62, 63]
-- **Paxos** [60, 64, 65, 66]
-- **Raft** [25, 67, 68]
-- **Zab** [20, 24, 69]
+- **Viewstamped Replication** [Oki & Liskov, 1988]
+- **Paxos** [Lamport, 2001]
+- **Raft** [Ongaro & Ousterhout, 2014]
+- **Zab** [Junqueira & Reed, 2013; Medeiros, 2012]
 
 These algorithms have quite a few similarities, but they are not the same. They all work in a **non-Byzantine system model** — that is, network communication may be arbitrarily delayed or dropped, and nodes may crash, restart, and become disconnected, but the algorithms assume that nodes otherwise follow the protocol correctly and do not behave maliciously.
 
@@ -1026,7 +965,7 @@ There are also consensus algorithms that can tolerate some Byzantine nodes (i.e.
 
 ### The Impossibility of Consensus
 
-You may have heard about the **FLP result** [74] — named after the authors Fischer, Lynch, and Paterson — which proves no algorithm is always able to reach consensus if there is a risk that a node may crash. In a distributed system, we must assume that nodes may crash, so reliable consensus is impossible. Yet, here we are, discussing algorithms for achieving consensus. What's going on here?
+You may have heard about the **FLP result** [Fischer et al., 1985] — named after the authors Fischer, Lynch, and Paterson — which proves no algorithm is always able to reach consensus if there is a risk that a node may crash. In a distributed system, we must assume that nodes may crash, so reliable consensus is impossible. Yet, here we are, discussing algorithms for achieving consensus. What's going on here?
 
 ```mermaid
 graph TB
@@ -1070,20 +1009,30 @@ Consensus can be expressed in several ways:
 - An **atomic fetch-and-add** (or atomic increment) operation also turns out to be equivalent to consensus.
 - **Atomic commitment** of a multidatabase or multishard transaction requires that all participants agree on whether to commit or abort the transaction.
 
-In fact, **these problems are all equivalent**. If you have an algorithm that solves one of these problems, you can convert it into a solution for any of the others. This is quite a profound and perhaps surprising insight. It's also why we can lump all these things together under "consensus," even though they look quite different on the surface.
+**These problems are all equivalent**: if you have an algorithm that solves one of these problems, you can convert it into a solution for any of the others. The subsections below sketch the equivalence proofs.
 
 ```mermaid
-graph TB
-    SV["Single-value<br/>consensus"] <--> CAS["Atomic CAS"]
-    SV <--> LOG["Shared log<br/>(total order broadcast)"]
-    SV <--> FAA["Atomic fetch-and-add<br/>(linearizable ID gen)"]
-    SV <--> AC["Atomic commit<br/>(2PC distributed txns)"]
+graph LR
+    subgraph "Equivalent Consensus Problems"
+        SV["Single-value consensus"]
+        CAS2["Atomic CAS"]
+        LOG["Shared log / total order broadcast"]
+        FAA["Atomic fetch-and-add"]
+        AC["Atomic commit"]
+    end
+
+    SV <-->|"equivalent"| CAS2
+    CAS2 <-->|"equivalent"| LOG
+    LOG <-->|"equivalent"| FAA
+    LOG <-->|"equivalent"| AC
+    CAS2 <-->|"equivalent"| FAA
+    CAS2 <-->|"equivalent"| AC
 
     style SV fill:#90EE90
-    style CAS fill:#87CEEB
-    style LOG fill:#87CEEB
-    style FAA fill:#87CEEB
-    style AC fill:#87CEEB
+    style CAS2 fill:#90EE90
+    style LOG fill:#90EE90
+    style FAA fill:#90EE90
+    style AC fill:#90EE90
 ```
 
 #### Single-Value Consensus
@@ -1110,7 +1059,7 @@ The uniform agreement and integrity properties define the core idea of consensus
 
 If you don't care about fault tolerance, satisfying the first three properties is easy. You can just hardcode one node to be the "dictator," and let that node make all the decisions. However, if that one node fails, the system can no longer make any decisions — just like single-leader replication without failover. **All the difficulty arises from the need for fault tolerance.**
 
-The termination property formalizes the idea of fault tolerance. It essentially says that a consensus algorithm cannot simply sit around and do nothing forever — in other words, it must make progress. Even if some nodes fail, the other nodes must still reach a decision. (Termination is a **liveness property**, whereas the other three are **safety properties**.)
+The termination property formalizes the idea of fault tolerance. It says that a consensus algorithm cannot simply sit around and do nothing forever — in other words, it must make progress. Even if some nodes fail, the other nodes must still reach a decision. (Termination is a **liveness property**, whereas the other three are **safety properties**.)
 
 If a crashed node may recover, you could just wait for it to come back. However, a consensus algorithm must ensure that it makes a decision even if a crashed node suddenly disappears and never comes back. (Instead of a software crash, imagine that an earthquake causes the datacenter containing your node to be destroyed by a landslide. You must assume that your node is buried under 30 feet of mud and is never going to come back online.)
 
@@ -1193,7 +1142,7 @@ An exception occurs if we know for sure that no more than **two** nodes will pro
 
 #### Atomic Commitment as Consensus
 
-In the distributed transactions chapter we saw the **atomic commitment** problem, which is to ensure that the databases or shards involved in a distributed transaction all either commit or abort a transaction. We also saw the two-phase commit algorithm, which relies on a coordinator that is a single point of failure.
+For the protocol mechanics of two-phase commit (the coordinator, prepare, commit, in-doubt recovery, etc.) see Chapter 8. This subsection keeps only the equivalence argument: atomic commitment is consensus.
 
 What is the relationship between consensus and atomic commitment? At first glance, they seem very similar — both require nodes to come to some form of agreement. However, there is one important difference: with consensus it's OK to decide any value that was proposed, whereas with atomic commitment the algorithm must **abort if any of the participants voted to abort**. More precisely, atomic commitment requires:
 
@@ -1212,30 +1161,6 @@ If you have a solution for consensus, you could solve atomic commitment in multi
 If you have a fault-tolerant atomic commitment protocol, you can also solve consensus. Every node that wants to propose a value starts a transaction on a quorum of nodes, and at each node it performs a single-node CAS to set a register to the proposed value if its value has not already been set by another transaction. If the CAS succeeds, the node votes to commit, and otherwise it votes to abort. If the atomic commit protocol commits a transaction, its value is decided for consensus; if atomic commit aborts, the proposing node retries with a new transaction.
 
 This shows that **atomic commit and consensus are also equivalent to each other**.
-
-```mermaid
-graph LR
-    subgraph "Equivalent Consensus Problems"
-        SV["Single-value consensus"]
-        CAS2["Atomic CAS"]
-        LOG["Shared log / total order broadcast"]
-        FAA["Atomic fetch-and-add"]
-        AC["Atomic commit"]
-    end
-
-    SV <-->|"equivalent"| CAS2
-    CAS2 <-->|"equivalent"| LOG
-    LOG <-->|"equivalent"| FAA
-    LOG <-->|"equivalent"| AC
-    CAS2 <-->|"equivalent"| FAA
-    CAS2 <-->|"equivalent"| AC
-
-    style SV fill:#90EE90
-    style CAS2 fill:#90EE90
-    style LOG fill:#90EE90
-    style FAA fill:#90EE90
-    style AC fill:#90EE90
-```
 
 ---
 
@@ -1277,6 +1202,8 @@ A shared log is also powerful because it can easily be adapted to other forms of
 - For an atomic fetch-and-add, put the number to add to the counter in a log entry, and have the current counter value be the sum of all the log entries so far. A simple counter on log entries can be used to generate **fencing tokens**; for example, in ZooKeeper, this sequence number is called `zxid`.
 
 ### From Single-Leader Replication to Consensus
+
+The failover and split-brain problem with single-leader replication is covered in Chapter 6 §1.4. This subsection focuses on how consensus algorithms solve it.
 
 We saw previously that single-value consensus is easy if you have a single "dictator" node that makes the decision, and likewise a shared log is easy if a single leader is the only node allowed to append log entries. The question is how to provide fault tolerance if that node fails.
 
@@ -1428,7 +1355,7 @@ class RaftLeader:
 
 ### Pros and Cons of Consensus
 
-Although they are complex and subtle, consensus algorithms are a huge breakthrough for distributed systems. Consensus is essentially "single-leader replication done right," with automatic failover on leader failure, ensuring that no committed data is lost and split brain is not possible, even in the face of all the problems we discussed in Chapter 9.
+Although they are complex and subtle, consensus algorithms are a huge breakthrough for distributed systems. Consensus is "single-leader replication done right," with automatic failover on leader failure, ensuring that no committed data is lost and split brain is not possible, even in the face of all the problems we discussed in Chapter 9.
 
 Any system that provides automatic failover but does not use a proven consensus algorithm is likely to be unsafe. Using a proven consensus algorithm is not a guarantee of correctness of the whole system — there are still plenty of other places where bugs can lurk — but it's a good start.
 
@@ -1439,39 +1366,6 @@ Nevertheless, **consensus is not used everywhere because the benefits come at a 
 - **Unavailable under partition**: if a network partition cuts off some nodes from the rest, only the majority portion of the network can make progress, and the other nodes are blocked.
 - **Tuning timeouts is hard**: consensus systems generally rely on timeouts to detect failed nodes. In environments with highly variable network delays, especially systems distributed across multiple geographic regions, tuning these timeouts can be difficult. If they are too large, recovering from a failure takes a long time; if they are too small, lots of unnecessary leader elections can occur.
 
-```mermaid
-graph TB
-    subgraph "Benefits of Consensus"
-        B1["Automatic failover"]
-        B2["No split brain"]
-        B3["No committed data loss"]
-        B4["Linearizable + fault tolerant"]
-    end
-
-    subgraph "Costs of Consensus"
-        C1["Majority required<br/>(3 nodes for 1 failure)"]
-        C2["Throughput ceiling<br/>(limited by leader)"]
-        C3["Latency: multiple RTTs"]
-        C4["Hard across regions"]
-        C5["Timeout tuning is hard"]
-    end
-
-    B1 --> C1
-    B2 --> C2
-    B3 --> C3
-    B4 --> C4
-
-    style B1 fill:#90EE90
-    style B2 fill:#90EE90
-    style B3 fill:#90EE90
-    style B4 fill:#90EE90
-    style C1 fill:#FFA500
-    style C2 fill:#FFA500
-    style C3 fill:#FFA500
-    style C4 fill:#FFA500
-    style C5 fill:#FFA500
-```
-
 Sometimes consensus algorithms are particularly sensitive to network problems. For example, Raft has been shown to have unpleasant edge cases. If the entire network is working correctly except for one particular network link that is consistently unreliable, Raft can get into situations where leadership continually bounces between two nodes, or the current leader is continually forced to resign, so the system effectively never makes progress. The original Raft algorithm was extended with a pre-vote phase to address this. Paxos also depends on leaders, which can cause similar performance issues. **Egalitarian Paxos (EPaxos)** and its derivatives use a leaderless protocol that is more robust against poorly performing nodes or network connections.
 
 ---
@@ -1479,6 +1373,8 @@ Sometimes consensus algorithms are particularly sensitive to network problems. F
 ## 5. Coordination Services
 
 Consensus algorithms are useful in any distributed database that wants to offer linearizable operations, and many modern distributed databases use them for replication. But one family of systems is a particularly prominent user of consensus: **coordination services** such as ZooKeeper, etcd, and Consul. Although these systems look superficially like any other key-value store, they are not designed for high write volumes or general-purpose data storage, like most databases.
+
+This chapter is the canonical home for **distributed locks, leases, and fencing tokens** (cross-referenced from Chapter 6 §1.4 and Chapter 9 §10). Coordination services like ZooKeeper and etcd are the standard off-the-shelf implementations: don't build your own.
 
 Instead, they are designed to **coordinate among nodes of another distributed system**. For example, Kubernetes relies on etcd, while Spark and Flink in high availability mode rely on ZooKeeper running in the background. Coordination services are designed to hold small amounts of data that can fit entirely in memory (although they still write to disk for durability), which is replicated across multiple nodes via a fault-tolerant consensus algorithm.
 
@@ -1509,7 +1405,7 @@ graph TB
     style CHUBBY fill:#87CEEB
 ```
 
-Coordination services are modeled after Google's **Chubby lock service** [19, 60]. They combine a consensus algorithm with several other features that turn out to be particularly useful when building distributed systems:
+Coordination services are modeled after Google's **Chubby lock service** [Burrows, 2006]. They combine a consensus algorithm with several other features that turn out to be particularly useful when building distributed systems:
 
 #### Locks and Leases
 
@@ -1653,7 +1549,7 @@ sequenceDiagram
 
 ---
 
-## 6. Summary
+## Summary
 
 In this chapter we examined the topic of strong consistency in fault-tolerant systems: what it is and how to achieve it. We looked in depth at **linearizability**, a popular formalization of strong consistency that ensures replicated data appears as though there were only a single copy, with all operations acting on it atomically. We saw that linearizability is useful if you need some data to be up-to-date when you read it, or if you need to resolve a race condition (e.g., if multiple nodes are concurrently trying to do the same thing, such as creating files with the same name).
 
@@ -1662,25 +1558,6 @@ Although linearizability is appealing because it is easy to understand — it ma
 Next, we applied the concept of linearizability in the context of ID generators. A single-node autoincrementing counter is linearizable but not fault-tolerant. Many distributed ID generation schemes don't guarantee that the IDs are ordered consistently with the order in which the events actually happened. **Logical clocks such as Lamport clocks and hybrid logical clocks provide ordering that is consistent with causality but do not ensure linearizability.**
 
 This led us to **consensus algorithms**, which make it possible to implement fault-tolerant, linearizable replication. Linearizability means the system must behave as if there is only one copy of the data, and all operations happen one at a time to that single copy, in a well-defined order. Consensus provides this by making a group of nodes agree on a single sequence of operations, even if messages are delayed or some nodes fail. That sequence of operations makes a distributed system behave as though only one node is processing operations in order, even though a group of nodes is working together.
-
-```mermaid
-graph TB
-    subgraph "Big Picture of the Chapter"
-        L["Linearizability<br/>(strong consistency)"]
-        ID["Logical Clocks<br/>Lamport, hybrid, vector"]
-        C["Consensus<br/>(fault-tolerant agreement)"]
-        CO["Coordination Services<br/>ZK, etcd, Consul"]
-
-        L -->|"needs IDs"| ID
-        ID -->|"insufficient for CAS/locks"| C
-        C -->|"implemented by"| CO
-
-        style L fill:#87CEEB
-        style ID fill:#DDA0DD
-        style C fill:#90EE90
-        style CO fill:#FFD700
-    end
-```
 
 The classic formulation of consensus involves deciding on a single value in such a way that all nodes agree on what was decided, and such that they can't change their minds. A wide range of problems are actually reducible to consensus and are equivalent to one another (i.e., if you have a solution for one of them, you can transform it into a solution for all of the others). Such equivalent problems include:
 
@@ -1695,127 +1572,32 @@ The classic formulation of consensus involves deciding on a single value in such
 
 All of these are straightforward if you have only a single node or if you are willing to assign the decision-making capability to a single node. This is what happens in a single-leader database: all the power to make decisions is vested in the leader, which is why such databases are able to provide linearizable operations, uniqueness constraints, a replication log, and more.
 
-However, if that single leader fails, or if a network interruption makes the leader unreachable, such a system becomes unable to make any progress until a human performs a manual failover. Widely used consensus algorithms like Raft and Paxos are essentially single-leader replication with built-in automatic leader election and failover if the current leader fails.
+However, if that single leader fails, or if a network interruption makes the leader unreachable, such a system becomes unable to make any progress until a human performs a manual failover. Widely used consensus algorithms like Raft and Paxos are single-leader replication with built-in automatic leader election and failover if the current leader fails.
 
 Consensus algorithms are carefully designed to ensure that no committed writes are lost during a failover and that the system cannot get into a split-brain state in which multiple nodes are accepting writes. This requires that every write, and every linearizable read, is confirmed by a quorum (typically a majority) of nodes. This can be expensive, especially across geographic regions, but it is unavoidable if you want the strong consistency and fault tolerance that consensus provides.
 
-Coordination services like ZooKeeper and etcd are also built on top of consensus algorithms. They provide locks, leases, failure detection, and change notification features that are useful for managing the state of distributed applications. If you find yourself wanting to do one of those things that is reducible to consensus, and you want it to be fault-tolerant, it is advisable to use a coordination service. It won't guarantee that you will get it right, but it will probably help.
+Coordination services like ZooKeeper and etcd are also built on top of consensus algorithms. They provide locks, leases, failure detection, and change notification features that are useful for managing the state of distributed applications. **This chapter is the canonical home for fencing tokens, distributed locks, and leases** (cross-referenced from Chapter 6 §1.4 and Chapter 9 §10). If you find yourself wanting to do one of those things that is reducible to consensus, and you want it to be fault-tolerant, use a coordination service rather than implementing it yourself.
 
 Consensus algorithms are complicated and subtle, but they are supported by a rich body of theory that has been developed since the 1980s. This theory makes it possible to build systems that can tolerate all the faults that we discussed in Chapter 9 and still ensure that your data is not corrupted. This is an amazing achievement, and the references at the end of this chapter feature some of the highlights of this work.
 
 Nevertheless, **consensus is not always the right tool**. In some systems, the strong consistency properties it provides are not needed, and it is better to have weaker consistency with higher availability and better performance. In these cases, it is common to use leaderless or multi-leader replication, which we discussed in Chapter 6. The logical clocks that we discussed in this chapter are helpful in that context.
 
-### Practical Takeaways
-
-```python
-class DesignChoices:
-    """When to use what — practical guidance."""
-
-    @staticmethod
-    def use_linearizability_when():
-        return [
-            "Strong consistency absolutely required",
-            "Leader election / distributed locks",
-            "Unique constraints (username, ID)",
-            "Cross-channel timing dependencies",
-            "Bank balance, inventory count",
-        ]
-
-    @staticmethod
-    def use_logical_clock_when():
-        return [
-            "Distributed event ordering without consensus",
-            "Snapshot isolation transaction IDs",
-            "Causal ordering without linearizability",
-            "Approximate wall-clock + causality",
-        ]
-
-    @staticmethod
-    def use_consensus_when():
-        return [
-            "Need linearizable + fault-tolerant",
-            "Leader election with auto-failover",
-            "Distributed locks / leases with fencing",
-            "Shared log for replication",
-        ]
-
-    @staticmethod
-    def use_coordination_service_when():
-        return [
-            "Need consensus but don't want to implement it",
-            "Configuration management",
-            "Service discovery (with caveats)",
-            "Small amounts of slow-changing critical state",
-        ]
-
-    @staticmethod
-    def anti_patterns():
-        return [
-            "Don't use consensus for high-throughput data",
-            "Don't use linearizable storage for everything",
-            "Don't implement Paxos yourself (use Raft or library)",
-            "Don't use ZooKeeper as a primary database",
-            "Don't expect consensus to be fast",
-            "Don't ignore network partitions in design",
-            "Don't assume wall clocks are synchronized",
-        ]
-```
-
-```mermaid
-graph TB
-    subgraph "Decision Flow"
-        Q1["Do you need linearizable + fault-tolerant?"]
-        Q1 -->|"No"| EC["Use weaker consistency<br/>(eventual, causal)"]
-        Q1 -->|"Yes"| Q2["Are you OK with single-region?"]
-        Q2 -->|"No"| MULTI["Single-leader is hard across regions.<br/>Consider Spanner-style with<br/>TrueTime + uncertainty intervals"]
-        Q2 -->|"Yes"| Q3["DIY consensus or use library?"]
-        Q3 -->|"DIY: no"| COORD["Use coordination service<br/>(etcd, ZooKeeper, Consul)"]
-        Q3 -->|"DIY: yes"| ALGO["Implement Raft/Paxos<br/>(very carefully!)"]
-    end
-
-    style EC fill:#ffcccc
-    style MULTI fill:#FFA500
-    style COORD fill:#90EE90
-    style ALGO fill:#FFD700
-```
-
-### Looking Forward
-
-Consensus is fundamental to distributed systems, but it is not the only way to build reliable systems. In real-world applications:
-
-- **Most data doesn't need consensus**: eventual consistency is fine.
-- **Consensus for coordination only**: leader election, configuration.
-- **Avoid consensus when possible**: it is slow and complex.
-- **When you need it, use a library**: ZooKeeper, etcd, Consul.
-
-The next frontier includes approaches that sidestep consensus entirely (e.g., CRDTs — conflict-free replicated data types — which converge without consensus) and approaches that make consensus more efficient (e.g., EPaxos, Flexible Paxos). But those are beyond the scope of this book.
-
-**Final thought**: Building distributed systems is hard. Understanding consistency, ordering, and consensus helps you make informed trade-offs between consistency, availability, and performance. The theory is your friend, even when the practice is unforgiving.
+When consensus is required, **use it for coordination only** (leader election, configuration, fencing) — not for high-throughput data. If you need it, **use a coordination service** (ZooKeeper, etcd, Consul) rather than implementing Paxos yourself.
 
 ---
 
 ## References (Selected)
 
-[1] Maurice P. Herlihy and Jeannette M. Wing. "Linearizability: A Correctness Condition for Concurrent Objects." ACM TOPLAS, 12(3), 1990.
-
-[25] Diego Ongaro and John K. Ousterhout. "In Search of an Understandable Consensus Algorithm." USENIX ATC, 2014. (Raft)
-
-[56] Leslie Lamport. "Time, Clocks, and the Ordering of Events in a Distributed System." CACM, 21(7), 1978. (Lamport timestamps)
-
-[57] Sandeep S. Kulkarni et al. "Logical Physical Clocks." OPODIS, 2014. (Hybrid logical clocks)
-
-[64] Leslie Lamport. "Paxos Made Simple." ACM SIGACT News, 32(4), 2001.
-
-[69] André Medeiros. "ZooKeeper's Atomic Broadcast Protocol: Theory and Practice." Aalto University, 2012. (Zab)
-
-[74] Michael J. Fischer, Nancy Lynch, and Michael S. Paterson. "Impossibility of Distributed Consensus with One Faulty Process." JACM, 32(2), 1985. (FLP)
-
-[19] Mike Burrows. "The Chubby Lock Service for Loosely-Coupled Distributed Systems." OSDI, 2006.
-
-[20] Flavio P. Junqueira and Benjamin Reed. ZooKeeper: Distributed Process Coordination. O'Reilly, 2013.
-
-[52] Kyzer R. Davis, Brad G. Peabody, and Paul J. Leach. "Universally Unique IDentifiers (UUIDs)." RFC 9562, 2024.
-
-[53] Ryan King. "Announcing Snowflake." blog.x.com, 2010.
-
-[59] Daniel Peng and Frank Dabek. "Large-Scale Incremental Processing Using Distributed Transactions and Notifications." OSDI, 2010. (Percolator)
+- [Herlihy & Wing, 1990] Maurice P. Herlihy and Jeannette M. Wing. "Linearizability: A Correctness Condition for Concurrent Objects." ACM TOPLAS, 12(3), 1990.
+- [Burrows, 2006] Mike Burrows. "The Chubby Lock Service for Loosely-Coupled Distributed Systems." OSDI, 2006.
+- [Junqueira & Reed, 2013] Flavio P. Junqueira and Benjamin Reed. ZooKeeper: Distributed Process Coordination. O'Reilly, 2013.
+- [Ongaro & Ousterhout, 2014] Diego Ongaro and John K. Ousterhout. "In Search of an Understandable Consensus Algorithm." USENIX ATC, 2014. (Raft)
+- [Davis et al., 2024] Kyzer R. Davis, Brad G. Peabody, and Paul J. Leach. "Universally Unique IDentifiers (UUIDs)." RFC 9562, 2024.
+- [King, 2010] Ryan King. "Announcing Snowflake." blog.x.com, 2010.
+- [Lamport, 1978] Leslie Lamport. "Time, Clocks, and the Ordering of Events in a Distributed System." CACM, 21(7), 1978. (Lamport timestamps)
+- [Kulkarni et al., 2014] Sandeep S. Kulkarni et al. "Logical Physical Clocks." OPODIS, 2014. (Hybrid logical clocks)
+- [Lamport, 2001] Leslie Lamport. "Paxos Made Simple." ACM SIGACT News, 32(4), 2001.
+- [Medeiros, 2012] André Medeiros. "ZooKeeper's Atomic Broadcast Protocol: Theory and Practice." Aalto University, 2012. (Zab)
+- [Fischer et al., 1985] Michael J. Fischer, Nancy Lynch, and Michael S. Paterson. "Impossibility of Distributed Consensus with One Faulty Process." JACM, 32(2), 1985. (FLP)
+- [Oki & Liskov, 1988] Brian M. Oki and Barbara H. Liskov. "Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems." PODC, 1988.
+- [Peng & Dabek, 2010] Daniel Peng and Frank Dabek. "Large-Scale Incremental Processing Using Distributed Transactions and Notifications." OSDI, 2010. (Percolator)

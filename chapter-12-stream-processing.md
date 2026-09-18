@@ -1,5 +1,13 @@
 # Chapter 12: Stream Processing
 
+## TL;DR
+
+- Streams are unbounded, incrementally available data; stream processing is the continuous counterpart to batch processing from Ch11.
+- Log-based message brokers (Kafka, Kinesis) are the canonical transport: they retain messages on disk, preserve per-partition order, and let consumers replay.
+- Change Data Capture (CDC) turns a database's write log into a stream — this chapter owns the mechanics; Ch13 owns the philosophy of derived data.
+- Joins, windows, and time (event time vs processing time) are the core primitives of stream processing.
+- Fault tolerance in streams requires microbatching, checkpointing, transactions, or idempotent writes — since "discard and restart" works for batch but not for continuous output.
+
 ## Introduction
 
 In Chapter 11, we discussed **batch processing**: running a job on a bounded dataset. Now we explore **stream processing** — processing unbounded data that arrives continuously.
@@ -50,22 +58,6 @@ In batch processing, the inputs and outputs of a job are files. What does the st
 
 When the input is a file (a sequence of bytes), the first processing step is usually to parse it into a sequence of records. In a stream processing context, a record is more commonly known as an **event**: a small, self-contained, immutable object containing the details of something that happened at a point in time. An event usually contains a **timestamp** indicating when it happened according to a time-of-day clock.
 
-```mermaid
-graph LR
-    subgraph "Event Anatomy"
-        EVENT["Event:<br/>timestamp: 2024-01-15T10:30:00<br/>user_id: 12345<br/>type: 'page_view'<br/>page: '/products'<br/>session_id: 'abc123'"]
-    end
-
-    subgraph "Event Properties"
-        IMMUTABLE["✓ Immutable<br/>✓ Timestamped<br/>✓ Self-contained<br/>✓ Append-only"]
-    end
-
-    EVENT -.-> IMMUTABLE
-
-    style EVENT fill:#90EE90
-    style IMMUTABLE fill:#87CEEB
-```
-
 An event may be encoded as text (JSON, XML) or a binary format (Avro, Protocol Buffers, as discussed in Chapter 5). Related events are usually grouped together into a **topic** or **stream**.
 
 A producer writes events to the broker; consumers read them. Producers and consumers can be added or removed dynamically without coordinating with one another.
@@ -112,7 +104,7 @@ These work well in the situations they are designed for, but they require the ap
 
 ### Message Brokers
 
-A widely used alternative is to send messages via a **message broker** (also known as a message queue) — essentially a kind of database optimized for handling message streams. The broker runs as a server, with producers and consumers connecting as clients.
+A widely used alternative is to send messages via a **message broker** (also known as a message queue) — a kind of database optimized for handling message streams. The broker runs as a server, with producers and consumers connecting as clients.
 
 ```mermaid
 graph TB
@@ -315,31 +307,6 @@ producer.send('user_events', key=str(event['user_id']).encode(), value=event)
 
 The log-based approach trivially supports **fan-out** because several consumers can independently read the log without affecting one another. To achieve **load balancing**, the broker assigns entire shards to consumer nodes rather than individual messages.
 
-```mermaid
-graph TB
-    subgraph "Fan-out (cross consumer groups)"
-        LOG1["Partition"]
-        G1C1["Group A<br/>Consumer 1"]
-        G2C1["Group B<br/>Consumer 1"]
-
-        LOG1 --> G1C1
-        LOG1 --> G2C1
-    end
-
-    subgraph "Load balancing (within consumer group)"
-        LOG2["Partition 0"]
-        LOG3["Partition 1"]
-        G_C1["Group A<br/>Consumer 1"]
-        G_C2["Group A<br/>Consumer 2"]
-
-        LOG2 --> G_C1
-        LOG3 --> G_C2
-    end
-
-    style G1C1 fill:#90EE90
-    style G2C1 fill:#90EE90
-```
-
 This coarse-grained load balancing has trade-offs:
 - **Limit**: Number of nodes sharing work ≤ number of partitions in the topic
 - **Head-of-line blocking**: A slow message delays subsequent messages in that partition
@@ -524,7 +491,7 @@ graph TB
 
 With CDC, the database decides on the order in which to execute writes and writes them to its replication log in that order. The search index picks up and applies them in the same order. The data in the search index matches the database because both follow the same single leader (the database).
 
-CDC essentially makes one database the leader and turns the others into followers. A log-based message broker is well-suited for transporting change events since it preserves message ordering.
+CDC makes one database the leader and turns the others into followers. A log-based message broker is well-suited for transporting change events since it preserves message ordering. The philosophical implications of treating all derived systems as derived views of a single source of truth are explored in Ch13.
 
 #### Implementing CDC
 
@@ -566,29 +533,9 @@ Building a new full-text index requires a full copy of the entire database — a
 
 #### Log Compaction in CDC
 
-If you can keep only a limited amount of log history, you must go through the snapshot process every time you add a new derived data system. However, **log compaction** provides a better alternative.
+If you can keep only a limited amount of log history, you must go through the snapshot process every time you add a new derived data system. **Log compaction** is a better alternative: the storage engine periodically throws away log records with the same key and keeps only the most recent update per key, making log segments much smaller (see Chapter 4 for the storage-engine mechanism). For CDC, if every change has a primary key and updates replace previous values, retaining only the most recent write per key is sufficient — to rebuild a derived data system, you can start from offset 0 of the compacted topic and scan sequentially, guaranteed to see the latest value for every key.
 
-The storage engine periodically looks for log records with the same key, throws away duplicates, and keeps only the most recent update for each key. This makes log segments much smaller; segments may also be merged as part of the process.
-
-```mermaid
-graph TB
-    subgraph "Before Compaction"
-        BEFORE["user:123 = {name: 'Alice'}<br/>user:456 = {name: 'Bob'}<br/>user:123 = {name: 'Alice Updated'}<br/>user:789 = {name: 'Carol'}<br/>user:456 = {name: 'Bob Updated'}<br/>user:123 = {name: 'Alice V3'}"]
-    end
-
-    subgraph "After Compaction"
-        AFTER["user:123 = {name: 'Alice V3'}<br/>user:789 = {name: 'Carol'}<br/>user:456 = {name: 'Bob Updated'}"]
-    end
-
-    BEFORE -->|"Compact"| AFTER
-
-    style BEFORE fill:#ffcccc
-    style AFTER fill:#90EE90
-```
-
-The disk space required for a compacted log depends only on the **current contents** of the database, not the number of writes that have ever occurred.
-
-The same idea works in CDC: if every change has a primary key and updates replace previous values, it's sufficient to keep just the most recent write per key. To rebuild a derived data system, you can start from offset 0 of the compacted topic and scan sequentially — the log is guaranteed to contain the most recent value for every key. This lets the broker serve as durable storage, not just transient messaging.
+The disk space required for a compacted log depends only on the **current contents** of the database, not the number of writes that have ever occurred. This lets the broker serve as durable storage, not just transient messaging.
 
 #### API Support for Change Streams
 
@@ -655,21 +602,7 @@ We normally think of databases as storing the current state. State changes, so d
 
 **Key insight**: whenever you have state that changes, that state is the result of the events that mutated it over time. The current available seats are the result of reservations processed, the current account balance is the result of credits and debits, and the response time graph is an aggregation of all web request response times.
 
-```mermaid
-graph LR
-    subgraph "Mathematics Analogy"
-        STATE["State = ∫ events dt<br/>(integral over time)"]
-        CHANGES["Changes = dState/dt<br/>(derivative)"]
-    end
-
-    STATE -.->|"Differentiation"| CHANGES
-    CHANGES -.->|"Integration"| STATE
-
-    style STATE fill:#90EE90
-    style CHANGES fill:#87CEEB
-```
-
-Mutable state and an append-only log of immutable events are two sides of the same coin. The log of all changes (changelog) represents the evolution of state over time. As Jim Gray and Andreas Reuter put it in 1992:
+Mutable state and an append-only log of immutable events are two sides of the same coin. The log of all changes (changelog) represents the evolution of state over time. As [Gray and Reuter, 1992] put it:
 
 > There is no fundamental need to keep a database at all; the log contains all the information there is. The only reason for storing the database (i.e., the current end-of-the-log) is performance of retrieval operations.
 
@@ -886,25 +819,6 @@ Beyond multi-event patterns, sometimes you need to search for individual events 
 
 Conventional search engines index documents then run queries. **Searching a stream turns this on its head**: queries are stored, and documents are evaluated against them (like CEP). Elasticsearch's **percolator** feature implements this kind of stream search. To optimize, you can index the queries as well as documents to narrow the set that may match.
 
-#### Stream Processing Uses Summary
-
-```mermaid
-graph TB
-    subgraph "Uses of Stream Processing"
-        CEP["CEP<br/>Pattern matching"]
-        ANALYTICS["Stream Analytics<br/>Aggregations & metrics"]
-        MV["Materialized Views<br/>Keep derived data fresh"]
-        IVM["IVM<br/>Incremental SQL queries"]
-        SEARCH["Stream Search<br/>Full-text on streams"]
-    end
-
-    style CEP fill:#90EE90
-    style ANALYTICS fill:#87CEEB
-    style MV fill:#DDA0DD
-    style IVM fill:#FFB6C1
-    style SEARCH fill:#ffeb3b
-```
-
 ### Reasoning About Time
 
 Stream processors often need to deal with time, especially for analytics using time windows. The meaning of "the last five minutes" seems unambiguous but is surprisingly tricky.
@@ -915,37 +829,9 @@ Many stream processing frameworks use the **local system clock** on the processi
 
 #### Event Time Versus Processing Time
 
-Processing may be delayed for many reasons:
-- Queueing
-- Network faults
-- Performance issues / contention
-- Restart of stream consumer
-- Reprocessing of past events while recovering from fault or bug
+Processing may be delayed for many reasons: queueing, network faults, performance issues / contention, restart of stream consumer, and reprocessing of past events while recovering from fault or bug. Message delays can also lead to unpredictable ordering — a user makes one web request handled by server A, then another handled by server B; B's event reaches the broker before A's, so processors see them in the opposite order. (The **Star Wars analogy** captures this: Episodes IV–VI came out in 1977–1983, then I–III in 1999–2005, then VII–IX in 2015–2019; release order is inconsistent with narrative order, just like processing time can be inconsistent with event time.)
 
-**Message delays can lead to unpredictable ordering**. A user makes one web request handled by server A, then another handled by server B. B's event reaches the broker before A's — processors see them in the opposite order.
-
-A good analogy is the **Star Wars movies**: Episode IV came out in 1977, Episode V in 1980, Episode VI in 1983, followed by Episodes I, II, III in 1999, 2002, 2005, then VII, VIII, IX in 2015, 2017, 2019. If you watched them in release order, the order you processed them is inconsistent with their narrative order. The episode number is like the event timestamp; the date you watched is processing time.
-
-**Confusing event time and processing time leads to bad data**. A rate counter (requests per second) based on processing time will look anomalous if you redeploy the processor — it shuts down for a minute, then processes a backlog when it comes back, making it look like a spike of requests when the actual rate was steady.
-
-```mermaid
-graph TB
-    subgraph "Event Time"
-        ET["Event Time:<br/>When event occurred at source"]
-        ET_EX["Example:<br/>User clicked at 10:00:00"]
-    end
-
-    subgraph "Processing Time"
-        PT["Processing Time:<br/>When event processed by stream processor"]
-        PT_EX["Example:<br/>Processed at 10:00:15"]
-    end
-
-    ET -.-> ET_EX
-    PT -.-> PT_EX
-
-    style ET fill:#90EE90
-    style PT fill:#ffeb3b
-```
+Confusing event time and processing time leads to bad data. A rate counter (requests per second) based on processing time will look anomalous if you redeploy the processor — it shuts down for a minute, then processes a backlog when it comes back, making it look like a spike of requests when the actual rate was steady.
 
 #### Handling Straggler Events
 
@@ -953,16 +839,8 @@ When defining windows in event time, you can never be sure whether you've receiv
 
 You can time out and declare a window ready after not seeing new events for a while. However, events could be buffered on another machine, delayed by a network interruption. You must handle **straggler events** that arrive after the window is declared complete. Two options:
 
-```mermaid
-graph TB
-    subgraph "Straggler Event Strategies"
-        IGNORE["Ignore:<br/>Discard late events<br/>Track metric of dropped events"]
-        RECOMPUTE["Publish correction:<br/>Updated window value<br/>with stragglers included"]
-    end
-
-    style IGNORE fill:#ffcccc
-    style RECOMPUTE fill:#90EE90
-```
+- **Ignore**: discard late events, and track a metric of dropped events.
+- **Publish correction**: emit an updated window value with stragglers included.
 
 A special message can indicate "from now on, there will be no more messages with timestamp earlier than t," which consumers can use to trigger windows. If multiple producers exist with their own thresholds, consumers must track each producer individually.
 
@@ -1007,7 +885,7 @@ Window operations usually maintain temporary state. Some windows keep fixed-size
 
 Joins form an important part of data pipelines. Since stream processing generalizes pipelines to incremental processing of unbounded data, the same need for joins exists. However, the fact that new events appear at any time makes joins more challenging than in batch.
 
-Three types of stream joins: **stream-stream**, **stream-table**, **table-table**.
+Three types of stream joins: **stream-stream**, **stream-table**, **table-table**. All three require the processor to maintain state derived from one input and query that state when processing records from the other input. Across all three, the join is complicated by the same fundamental issue: the matching record may never arrive, or it may arrive out of order — the join must tolerate missing or reordered events.
 
 #### Stream-Stream Join (Window Join)
 
@@ -1041,9 +919,7 @@ To implement, the stream processor maintains state: all events in the last hour,
 
 The same join used in batch (joining activity events with user profiles) is natural to perform continuously. Input: a stream of activity events containing user IDs. Output: activity events where user IDs are augmented with profile information. This is **enrichment**.
 
-To perform the join, the stream process takes one activity event, looks up the user ID in the database, and adds profile info. The database lookup could be a remote query — but as discussed in Chapter 11, remote queries are slow and risk overloading the database.
-
-Better: load a copy of the database into the stream processor for **local queries without network round trip** (a hash join since the local copy may be an in-memory hash table or on-disk index).
+To perform the join, the stream processor loads a local copy of the database into memory (or an on-disk index) and looks up the user ID locally instead of making a remote query on every event — remote queries are slow and risk overloading the database. Because the stream processor is long-running and the source database changes over time, the local copy must be kept up-to-date: subscribe to a CDC changelog of the user-profile database, and update the local copy when a profile is created or modified. The join then becomes a join between two streams: activity events and profile updates.
 
 ```mermaid
 graph LR
@@ -1066,8 +942,6 @@ graph LR
     style USERS fill:#87CEEB
     style ENRICHED fill:#ffeb3b
 ```
-
-The difference from batch: a batch job uses a point-in-time snapshot. A stream processor is long-running, and the database changes over time, so the local copy needs to be kept up-to-date. CDC solves this: subscribe to a changelog of the user profile database as well as activity events. When a profile is created/modified, update the local copy. The result is a join between two streams: activity events and profile updates.
 
 A stream-table join is similar to a stream-stream join. The biggest difference: for the table changelog stream, the join uses a window reaching back to "the beginning of time" (conceptually infinite), with newer versions overwriting older ones. For the stream input, the join might not maintain a window at all.
 
@@ -1112,8 +986,6 @@ GROUP BY follows.follower_id
 The timelines are a cache of the query result, updated whenever underlying tables change. The stream of changes to the materialized join follows the **product rule**: (u·v)′ = u′v + uv′ — any change of posts is joined with current followers, and any change of follows is joined with current posts.
 
 #### Time Dependence of Joins
-
-The three join types have much in common — they all require the processor to maintain state derived from one input and query that state when processing records from the other input.
 
 The order of events maintaining state matters. In sharded logs like Kafka, ordering within a partition is preserved but typically no ordering across partitions/streams. This raises a question: if events on different streams happen around similar times, in which order are they processed?
 
@@ -1311,107 +1183,44 @@ All options depend on infrastructure performance characteristics. Network delay 
 
 In this chapter we discussed event streams, the purposes they serve, and how to process them. Stream processing is like batch processing but done continuously on unbounded streams rather than on fixed-size input. Message brokers and event logs serve as the streaming equivalent of a filesystem.
 
-```mermaid
-graph TB
-    subgraph "Key Concepts"
-        EVENTS["Events:<br/>Immutable, timestamped"]
-        BROKERS["Messaging:<br/>AMQP/JMS vs<br/>log-based"]
-        CDC["CDC:<br/>Database changes<br/>as a stream"]
-        IMMUT["Immutability:<br/>Log as source of truth"]
-    end
+**Two broker models** (canonical comparison in §1):
+- **AMQP/JMS-style**: broker assigns individual messages to consumers; messages deleted after acknowledgment. Best for asynchronous RPC and task queues where exact ordering isn't important and re-reading old messages isn't needed.
+- **Log-based**: broker assigns all messages in a shard to the same consumer; messages always delivered in the same order. Parallelism through sharding; consumers track progress by offset. Messages retained on disk, allowing replay. Similar to database replication logs (Ch6) and log-structured storage engines (Ch4); a form of consensus (Ch10); especially appropriate for stream processing.
 
-    subgraph "Stream Processing"
-        USE["Uses: CEP, Analytics,<br/>Materialized Views"]
-        TIME["Time:<br/>Event vs processing time"]
-        JOINS["Joins: stream-stream,<br/>stream-table, table-table"]
-        FAULT["Fault tolerance:<br/>Exactly-once semantics"]
-    end
-
-    EVENTS --> BROKERS
-    BROKERS --> CDC
-    CDC --> IMMUT
-    IMMUT --> USE
-    USE --> TIME
-    USE --> JOINS
-    USE --> FAULT
-
-    style EVENTS fill:#90EE90
-    style CDC fill:#87CEEB
-    style IMMUT fill:#DDA0DD
-    style FAULT fill:#ffeb3b
-```
-
-**Two types of message brokers**:
-- **AMQP/JMS-style**: broker assigns individual messages to consumers; messages deleted after acknowledgment. Appropriate for asynchronous RPC and task queues where exact ordering isn't important and re-reading old messages isn't needed.
-- **Log-based**: broker assigns all messages in a shard to the same consumer; messages always delivered in same order. Parallelism through sharding; consumers track progress by offset. Messages retained on disk, allowing replay.
-
-The log-based approach has similarities to database replication logs (Chapter 6) and log-structured storage engines (Chapter 4). It is a form of consensus (Chapter 10). It's especially appropriate for stream processing systems consuming input streams and generating derived state or output streams.
-
-**Where streams come from**: user activity events, sensor readings, market data feeds — naturally represented as streams. Database writes can also be thought of as a stream. We can capture the changelog either implicitly through **CDC** or explicitly through **event sourcing**. **Log compaction** allows the stream to retain a full copy of database contents.
+**Where streams come from**: user activity events, sensor readings, market data feeds — naturally represented as streams. Database writes can also be thought of as a stream. We can capture the changelog either implicitly through **CDC** or explicitly through **event sourcing** (see Ch13 for the philosophy of derived data). **Log compaction** allows the stream to retain a full copy of database contents.
 
 **Keeping derived data fresh**: caches, search indexes, analytical systems can be kept continually up-to-date by consuming the change log and applying changes. You can even build fresh views by starting from scratch and consuming the change log from the beginning to the present.
 
 **Stream processing purposes**:
-- **Complex event processing**: searching for event patterns
-- **Stream analytics**: windowed aggregations
-- **Materialized views**: keeping derived data systems up-to-date
+- **Complex event processing** — search for patterns of events (queries stored long-term; events checked against standing queries).
+- **Stream analytics** — aggregations and statistical metrics, often over fixed time intervals.
+- **Materialized views** — keep derived data systems up-to-date; the application state in event sourcing is itself a materialized view.
+- **Incremental View Maintenance (IVM)** — convert SQL queries into incremental operators that update only changed data.
+- **Search on streams** — store queries, evaluate documents against them (e.g., Elasticsearch percolator).
 
-**Time challenges**: distinction between processing time and event timestamps; dealing with straggler events arriving after windows are considered complete.
+**Time challenges**:
+- Distinguish event time (when the event happened) from processing time (when the processor saw it).
+- Use watermarks / straggler-handling (ignore late events or publish corrections) to decide when a window is complete.
+- For joins against changing reference data, decide which point-in-time version to use (the slowly changing dimension problem).
 
 **Three types of stream joins**:
-- **Stream-stream**: both inputs are activity events; join within a time window
-- **Stream-table**: activity events + database changelog; changelog keeps local copy up-to-date
-- **Table-table**: both inputs are database changelogs; every change on one side joins with latest state of other; result is a stream of changes to materialized view
+- **Stream-stream**: both inputs are activity events; join within a time window.
+- **Stream-table**: activity events + database changelog; the changelog keeps a local copy up-to-date (powered by CDC).
+- **Table-table**: both inputs are database changelogs; every change on one side joins with latest state of other; result is a stream of changes to a materialized view.
 
-**Fault tolerance**: as with batch processing, discard partial output of failed tasks. Since streams are long-running with continuous output, finer-grained recovery is needed — microbatching, checkpointing, transactions, or idempotent writes.
+**Fault tolerance**: as with batch processing, discard partial output of failed tasks. Since streams are long-running with continuous output, finer-grained recovery is needed:
+- **Microbatching** (Spark Streaming) and **checkpointing** (Flink) give exactly-once within the framework.
+- **Atomic commit** across operator state, output, and offset advance is required when crossing boundaries (Google Cloud Dataflow, VoltDB, Kafka).
+- **Idempotent operations** (canonical home is here in Ch12; implementation examples in `examples/`) — using message offsets as deduplication keys, so retries have the same effect as the original write.
 
-### Comparison Table: Batch vs Stream Processing
-
-| Aspect | Batch Processing | Stream Processing |
-|--------|------------------|-------------------|
-| **Input** | Bounded (complete dataset) | Unbounded (continuous) |
-| **Latency** | Minutes to hours | Milliseconds to seconds |
-| **Results** | Complete, final | Continuous, approximate |
-| **State** | Materialized to disk | In-memory with checkpoints |
-| **Time** | Processing time only | Event time + processing time |
-| **Failures** | Retry entire job | Checkpoint and replay |
-| **Use cases** | Daily reports, ML training | Fraud detection, monitoring |
-| **Joins** | Sort-merge on full data | Window-based with state |
-| **Recovery** | Restart from beginning | Restart from offset/checkpoint |
-
-### Processing Guarantees
-
-```mermaid
-graph TB
-    subgraph "Processing Guarantees"
-        AT_MOST["At-most-once:<br/>May lose messages<br/>❌ Unacceptable for most apps"]
-
-        AT_LEAST["At-least-once:<br/>May process duplicates<br/>✓ OK if idempotent"]
-
-        EXACTLY["Exactly-once:<br/>Each message once<br/>✓ Ideal but complex"]
-    end
-
-    style AT_MOST fill:#ffcccc
-    style AT_LEAST fill:#ffeb3b
-    style EXACTLY fill:#90EE90
-```
-
-### Key Takeaways
-
-1. **Event logs are foundational** — durable, ordered, partitioned. They enable replay, multiple consumers, and massive throughput (millions of messages/sec).
-
+**Key takeaways**:
+1. **Event logs are foundational** — durable, ordered, partitioned. They enable replay, multiple consumers, and millions of messages/sec.
 2. **CDC unlocks integration** — observe database changes as a stream to keep caches, search indexes, and warehouses in sync without dual writes.
-
 3. **Time is complex in streams** — distinguish event time from processing time, use watermarks to track progress, handle late events explicitly.
-
 4. **Windowing enables aggregations** — tumbling (fixed non-overlapping), hopping (overlapping for smoothing), sliding (per event), session (activity-based).
-
 5. **Joins require state** — stream-stream (within time window), stream-table (lookup enrichment), table-table (maintain materialized view).
-
 6. **Immutability is powerful** — append-only logs preserve history, enable time travel, audit, and deriving multiple views from one source.
-
 7. **Exactly-once is achievable** — through idempotent operations, transactions, or careful checkpointing — but requires care when crossing system boundaries.
-
 8. **Different brokers for different needs** — JMS/AMQP for fine-grained load balancing of expensive messages; log-based (Kafka) for high-throughput, ordered, replayable streams.
 
 ---

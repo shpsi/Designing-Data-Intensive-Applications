@@ -1,6 +1,18 @@
 # Designing Data-Intensive Applications (2nd Edition)
 
-This repository explains the concepts from "Designing Data-Intensive Applications" by Martin Kleppmann (with Chris Riccomini), with chapter-by-chapter breakdowns and practical examples. Notes track the **2nd edition**.
+This repository explains the concepts from "Designing Data-Intensive Applications" by Martin Kleppmann, with chapter-by-chapter breakdowns and practical examples. Notes track the **2nd edition**.
+
+## TL;DR — What this book covers
+
+- **Foundations of data systems** — trade-offs between reliability, scalability, and maintainability, and how OLTP, OLAP, cloud-native, and distributed architectures frame those choices.
+- **Data models and storage** — relational, document, and graph models; column-oriented and log-structured (LSM) storage; B-trees; secondary and vector indexes; materialized views.
+- **Encoding, replication, and sharding** — schema evolution across formats, single-leader / multi-leader / leaderless replication, quorums, and strategies for partitioning data at scale.
+- **Transactions, consistency, and consensus** — ACID semantics, isolation levels, two-phase commit, linearizability, Lamport/vector clocks, Paxos/Raft, and coordination services like ZooKeeper and etcd.
+- **Batch and stream processing, plus the ethics of data** — MapReduce, Dataflow, CDC, event sourcing, the end-to-end argument, and the responsibilities engineers carry around bias, privacy, and consent.
+
+## How to read this
+
+Each chapter in this repo mirrors a chapter of the book, with worked examples, diagrams, and cross-references to other chapters where a concept is treated more deeply. Diagrams are drawn in [Mermaid](https://mermaid.js.org/), so they render on GitHub without extra setup. Most chapters include runnable code snippets (Python, SQL, and small pseudo-code kernels); treat them as illustrations of the idea, not production code.
 
 ## Chapters
 
@@ -30,8 +42,8 @@ This repository explains the concepts from "Designing Data-Intensive Application
 
 - [Chapter 13: A Philosophy of Streaming Systems](./chapter-13-philosophy-streaming-systems.md) - Data integration via derived data, batch/stream unification, unbundling databases, designing applications around dataflow, observing derived state, the end-to-end argument, enforcing cross-system constraints, timeliness vs integrity, and self-auditing systems.
 
-- [Chapter 14: Doing the Right Thing](./chapter-14-doing-the-right-thing.md) - Ethical responsibilities in data systems: bias and discrimination in predictive analytics, feedback loops, privacy and tracking, consent, GDPR/CCPA implications, data as power, and the parallels to Industrial-Revolution-era regulation.
+- [Chapter 14: Doing the Right Thing](./chapter-14-doing-the-right-thing.md) - Ethical responsibilities in data systems: bias and discrimination in predictive analytics, feedback loops, privacy and tracking, consent, GDPR implications, data as power, and the parallels to Industrial-Revolution-era regulation.
 
 ## Source
 
-The 2nd edition PDF lives at `~/Downloads/designing-data-intensive-applications-the-big-ideas-behind-reliable-scalable-and-maintainable-systems-2_compress.pdf`.
+Notes track the 2nd edition of "Designing Data-Intensive Applications" by Martin Kleppmann (O'Reilly, 2025), available from the publisher and standard booksellers.

@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .idea/
+
+# macOS resource fork files (created when accessing files on non-APFS volumes)
+._*

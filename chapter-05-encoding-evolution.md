@@ -1,5 +1,13 @@
 # Chapter 5: Encoding and Evolution
 
+## TL;DR
+
+- Applications change over time, so the encoding of the data they store or exchange must support **schema evolution** — backward compatibility (new code reads old data) and forward compatibility (old code reads new data).
+- Language-native encodings (pickle, Java Serializable, Marshal) tie you to one language, have weak versioning, and are unsafe with untrusted input; prefer a schema-driven cross-language format.
+- Text formats (JSON, XML, CSV) are widely supported but vague about datatypes and bulky. Binary formats split into **binary-JSON variants** (MessagePack, etc.) and **schema-driven** (Protobuf, Thrift, Avro), with schema-driven formats giving the best size, documentation, and compat-check tooling.
+- **Protobuf** identifies fields by numeric tag — change a tag and old data becomes invalid. **Avro** identifies fields by name and requires the writer's schema at decode time, making it friendlier to dynamically generated schemas (e.g., DB dumps).
+- Four modes of dataflow impose different compatibility needs: **databases** need both directions, **RPC** needs backward-compat on requests and forward-compat on responses, **workflows** add durability requirements, **event/actor systems** need both directions and often a schema registry.
+
 ## Introduction
 
 Applications inevitably change over time:
@@ -175,7 +183,7 @@ These encoding libraries are convenient because they allow in-memory objects to 
 
 **Verdict**: It's generally a bad idea to use your language's built-in encoding for anything other than very transient purposes.
 
-### 1.2 JSON, XML, and Binary Variants
+### 1.2 JSON, XML, and CSV
 
 When moving to standardized encodings that can be written and read by many programming languages, **JSON** and **XML** are the obvious contenders: they are widely known and widely supported. **CSV** is another popular language-independent format, but it supports only tabular data without nesting.
 
@@ -310,8 +318,8 @@ graph LR
 
     JSON -.-> MSGPACK
     MSGPACK -.-> THRIFT
-    THRIFT -.-> PB
-    PB -.-> AVRO
+    THRIFT --> PB
+    PB --> AVRO
 
     style JSON fill:#ffcccc
     style AVRO fill:#90EE90
@@ -331,7 +339,7 @@ In the following sections we will see how we can do much better, encoding the sa
 
 ## 2. Protocol Buffers and Apache Thrift
 
-Protocol Buffers (protobuf) is a binary encoding library developed at Google. It is similar to Apache Thrift, which was originally developed by Facebook; most of what this section says about Protocol Buffers also applies to Thrift.
+Protocol Buffers (protobuf) is a binary encoding library developed at Google. It is similar to Apache Thrift, which was originally developed at Facebook; most of what this section says about Protocol Buffers also applies to Thrift.
 
 ```mermaid
 graph TB
@@ -417,7 +425,7 @@ graph LR
 
 Protocol Buffers doesn't have an explicit list or array datatype. Instead, the `repeated` modifier on the `interests` field indicates that the field contains a list of values rather than a single value. In the binary encoding, the list elements are represented simply as repeated occurrences of the same field tag within the same record.
 
-### 2.2 Field Tags and Schema Evolution
+### 2.2 Schema Evolution Rules
 
 Schemas inevitably need to change over time — we call this **schema evolution**. How does Protocol Buffers handle schema changes while keeping backward and forward compatibility?
 
@@ -441,9 +449,20 @@ graph TB
 
 From this, you can see that **field tags are critical** to the meaning of the encoded data. You can change the name of a field in the schema, since the encoded data never refers to field names, but you cannot change a field's tag, since that would make all existing encoded data invalid.
 
-#### Adding Fields
+The single table below summarizes compatibility rules for both **Protobuf** and **Avro** (Avro details are discussed in §3). Pick one as your reference; the columns are forward compatibility (old code reads new data) and backward compatibility (new code reads old data).
 
-You can add new fields to the schema, provided that you give each field a new tag number. If old code (which doesn't know about the new tag numbers you added) tries to read data written by new code, including a new field with a tag number it doesn't recognize, it can simply **ignore that field**. The datatype annotation allows the parser to determine how many bytes it needs to skip while preserving the unknown fields, to avoid losing data. This maintains **forward compatibility**: old code can read records that were written by new code.
+| Action | Format | Forward-compat | Backward-compat | Notes |
+|--------|--------|----------------|-----------------|-------|
+| Add field with new tag (default value) | Protobuf | ✓ | ✓ | New readers see default for old data; old readers ignore unknown tag |
+| Remove field | Protobuf | ✓ | ✓ | Never reuse the tag — old data still references it |
+| Rename field (same tag) | Protobuf | ✓ | ✓ | Encoded data uses tags, not names |
+| Add field with default value | Avro | ✓ | ✓ | Default value is used when reader expects a field the writer didn't include |
+| Remove field with default value | Avro | ✓ | ✓ | Old readers see the writer's field, fill in reader's default if it has one |
+| Add field without default value | Avro | — | ✗ | Old readers can't fill a value for the missing field |
+| Remove field without default value | Avro | ✗ | — | New readers see an unexpected field with no default |
+| Rename field (with alias) | Avro | — | ✓ | Old writer's name maps via alias to new reader's name |
+| Change datatype (compatible widening) | Both | ⚠️ may truncate | ✓ | E.g., 32-bit → 64-bit is safe; 64-bit → 32-bit may truncate |
+| Reorder fields | Both | ✓ | ✓ | Protobuf uses tags; Avro resolves by name |
 
 ```protobuf
 // Schema v1
@@ -460,34 +479,9 @@ message Person {
 }
 ```
 
-#### Backward Compatibility
+In some programming languages, `null` is an acceptable default for any variable, but this is not the case in Avro: if you want to allow a field to be `null`, you have to use a **union type**. For example, `union { null, long, string } field;` indicates that the field can be a number, a string, or `null`. You can use `null` as a default value only if it is the first branch of the union. This is a little more verbose than having everything nullable by default, but it helps prevent bugs by being explicit about what can and cannot be `null`.
 
-What about backward compatibility? As long as each field has a unique tag number, new code can always read old data, because the tag numbers still have the same meaning. If a field is added in the new schema, and you read old data that does not yet contain that field, it is filled in with a **default value** (e.g., the empty string if the field type is string, or 0 if it's a number).
-
-#### Removing Fields
-
-Removing a field is similar to adding a field, with backward and forward compatibility concerns reversed. You can never use the same tag number again, because you may still have data written somewhere that includes the old tag number, and that field must be ignored by new code. Tag numbers used in the past can be reserved in the schema definition to ensure they are not forgotten.
-
-#### Changing Datatypes
-
-What about changing the datatype of a field? That is possible with some types — check the documentation for details — but there is a risk that values will get truncated. For example, say you change a 32-bit integer into a 64-bit integer:
-- New code can easily read data written by old code, because the parser can fill in any missing bits with zeros
-- However, if old code reads data written by new code, the old code is still using a 32-bit variable to hold the value. If the decoded 64-bit value won't fit in 32 bits, it will be **truncated**
-
-```mermaid
-graph TB
-    subgraph "Schema Evolution Rules"
-        ADD["Add field with new tag<br/>✓ Forward compatible<br/>✓ Backward compatible<br/>(default value)"]
-        REMOVE["Remove field<br/>✓ Backward compatible<br/>✓ Forward compatible<br/>(never reuse tag!)"]
-        TYPE["Change type<br/>⚠️ May truncate"]
-        NAME["Rename field<br/>✓ Allowed<br/>(tag stays same)"]
-    end
-
-    style ADD fill:#90EE90
-    style REMOVE fill:#87CEEB
-    style TYPE fill:#FFA500
-    style NAME fill:#DDA0DD
-```
+Changing the datatype of a field is possible, provided that the format can convert the type. In Avro specifically, the reader's schema can also contain **aliases** for field names, so it can match an old writer's schema field names against the aliases. Adding a branch to a union type is backward compatible but not forward compatible.
 
 ---
 
@@ -504,7 +498,7 @@ graph LR
         AVRO["Avro:<br/>Fields identified<br/>by name<br/>(no tags!)"]
     end
 
-    PROTO -.->|"Different<br/>approach"| AVRO
+    PROTO -.->|"Different<br>approach"| AVRO
 
     style PROTO fill:#87CEEB
     style AVRO fill:#90EE90
@@ -594,34 +588,7 @@ sequenceDiagram
 
 The Avro specification defines exactly how this resolution works. It's no problem if the writer's schema and the reader's schema have their fields in a different order, because the schema resolution matches up the fields by **field name**. If the code reading the data encounters a field that appears in the writer's schema but not in the reader's schema, it is ignored. If the code reading the data expects a certain field but the writer's schema does not contain a field of that name, it is filled in with a default value declared in the reader's schema.
 
-### 3.2 Schema Evolution Rules
-
-With Avro, **forward compatibility** means the writer can use a newer version of the schema than the reader. Conversely, **backward compatibility** means the writer can use an older version of the schema than the reader.
-
-```mermaid
-graph TB
-    subgraph "Avro Compatibility Matrix"
-        ADD["Add field with default<br/>✓ Backward compatible<br/>(new readers read old data)"]
-        REMOVE["Remove field<br/>with default<br/>✓ Forward compatible<br/>(old readers read new data)"]
-        ADD_NO["Add field WITHOUT default<br/>❌ Breaks backward compat"]
-        REMOVE_NO["Remove field WITHOUT default<br/>❌ Breaks forward compat"]
-    end
-
-    style ADD fill:#90EE90
-    style REMOVE fill:#90EE90
-    style ADD_NO fill:#ffcccc
-    style REMOVE_NO fill:#ffcccc
-```
-
-To maintain compatibility, you may **add or remove only a field that has a default value** (like the field `favoriteNumber` in our Avro schema). For example, say you add a field with a default value, so this new field exists in the new schema but not the old one. When a reader using the new schema reads a record written with the old schema, the default value is filled in for the missing field.
-
-If you were to add a field that has no default value, new readers wouldn't be able to read data written by old writers, so you would break backward compatibility. If you were to remove a field that has no default value, old readers wouldn't be able to read data written by new writers, so you would break forward compatibility.
-
-In some programming languages, `null` is an acceptable default for any variable, but this is not the case in Avro: if you want to allow a field to be `null`, you have to use a **union type**. For example, `union { null, long, string } field;` indicates that the field can be a number, a string, or `null`. You can use `null` as a default value only if it is the first branch of the union. This is a little more verbose than having everything nullable by default, but it helps prevent bugs by being explicit about what can and cannot be `null`.
-
-Changing the datatype of a field is possible, provided that Avro can convert the type. Changing the name of a field is also possible but a little tricky. The reader's schema can contain **aliases** for field names, so it can match an old writer's schema field names against the aliases. This means that changing a field name is backward compatible but not forward compatible. Similarly, adding a branch to a union type is backward compatible but not forward compatible.
-
-### 3.3 Where Does the Writer's Schema Come From?
+### 3.2 Where Does the Writer's Schema Come From?
 
 We've glossed over an important question: how does the reader know the schema that was used to encode a particular piece of data? We can't just include the entire schema with every record, because the schema would likely be much bigger than the encoded data, negating all the space savings from the binary encoding.
 
@@ -658,7 +625,7 @@ graph TB
 
 A database of schema versions is useful to have in any case, since it acts as documentation and gives you a chance to check schema compatibility. You can use a simple incrementing integer or a hash of the schema as the version number.
 
-### 3.4 Dynamically Generated Schemas
+### 3.3 Dynamically Generated Schemas
 
 One advantage of Avro's approach, compared to Protocol Buffers, is that the schema doesn't contain any tag numbers. But why is this important? What's the problem with keeping a couple of numbers in the schema?
 
@@ -929,16 +896,9 @@ graph TB
     style NET fill:#ffcccc
 ```
 
-A network request is very different from a local function call, for various reasons:
+A network request is very different from a local function call, and the full enumeration of those differences (predictability, timeouts, idempotency, variable latency, references, cross-language typing) is covered in the microservices discussion in Chapter 1.
 
-- **Predictability**: A local function call is predictable and either succeeds or fails depending on parameters that are under your control. A network request is unpredictable, for reasons that are entirely outside your control.
-- **Timeouts**: A local function call either returns a result, throws an exception, or never returns. A network request has another possible outcome: it may return without a result, because of a timeout. In that case, you simply don't know what happened.
-- **Idempotency**: If you retry a failed network request, it could happen that the previous request actually got through, and only the response was lost. Retrying will cause the action to be performed multiple times, unless you build a mechanism for deduplication (idempotence) into the protocol.
-- **Variable latency**: A local function call takes about the same time to execute every time. A network request is much slower than a function call, and its latency is also wildly variable.
-- **References**: When you call a local function, you can efficiently pass it references (pointers) to objects in local memory. When you make a network request, all those parameters need to be encoded into a sequence of bytes that can be sent over the network.
-- **Cross-language typing**: The client and the service may be implemented in different programming languages, so the RPC framework must translate datatypes from one language into another. This can end up ugly, since not all languages have the same types.
-
-All of these factors mean that there's no point trying to make a remote service look too much like a local object in your programming language, because it's a fundamentally different thing. Part of the appeal of REST is that it treats state transfer over a network as a process that is distinct from a function call.
+There's no point trying to make a remote service look too much like a local object in your programming language, because it's a fundamentally different thing. Part of the appeal of REST is that it treats state transfer over a network as a process that is distinct from a function call.
 
 #### Load Balancers, Service Discovery, and Service Meshes
 
@@ -1145,15 +1105,7 @@ graph LR
     style B fill:#ffeb3b
 ```
 
-Using a message broker has several advantages compared to direct RPC:
-
-- **Buffering**: It can act as a buffer if the recipient is unavailable or overloaded, improving system reliability
-- **Reliable delivery**: It can automatically redeliver messages to a process that has crashed, preventing messages from being lost
-- **No service discovery**: It avoids the need for service discovery, since senders do not need to directly connect to the IP address of the recipient
-- **Multiple recipients**: It allows the same message to be sent to several recipients
-- **Logical decoupling**: It logically decouples the sender from the recipient (the sender just publishes messages and doesn't care who consumes them)
-
-The communication via a message broker is **asynchronous**: the sender doesn't wait for the message to be delivered, but simply sends it and then forgets about it. It is possible, however, to implement a synchronous RPC-like model by having the sender wait for a response on a separate channel.
+Compared to direct RPC, using a message broker has several advantages: it can buffer if the recipient is unavailable or overloaded, redeliver to a crashed consumer, eliminate the need for service discovery, fan out to multiple recipients, and logically decouple the sender from the recipient. The communication via a message broker is **asynchronous**: the sender doesn't wait for the message to be delivered, but simply sends it and then forgets about it. It is possible to implement a synchronous RPC-like model by having the sender wait for a response on a separate channel.
 
 #### Message Brokers
 
@@ -1235,70 +1187,21 @@ In particular, many services need to support **rolling upgrades**, where a new v
 
 During rolling upgrades, or for various other reasons, we must assume that different nodes are running different versions of our application's code. Thus, it is important that all data flowing around the system is encoded in a way that provides **backward compatibility** (new code can read old data) and **forward compatibility** (old code can read new data).
 
-```mermaid
-graph TB
-    subgraph "Encoding Formats"
-        TEXT["Text:<br/>JSON, XML, CSV<br/>Human-readable<br/>Verbose"]
-
-        BIN["Binary:<br/>Protobuf, Thrift, Avro<br/>Compact<br/>Fast"]
-
-        SCHEMA["Schemas provide:<br/>✓ Documentation<br/>✓ Compatibility checks<br/>✓ Code generation"]
-    end
-
-    TEXT -.-> BIN
-    BIN --> SCHEMA
-
-    style BIN fill:#90EE90
-    style SCHEMA fill:#ffeb3b
-```
-
-We discussed several data encoding formats and their compatibility properties:
-
+**Encoding formats recap**:
 - **Programming language-specific encodings** are restricted to a single programming language and often fail to provide forward and backward compatibility.
-- **Textual formats** like JSON, XML, and CSV are widespread, and their compatibility depends on how you use them. They have optional schema languages, which are sometimes helpful and sometimes a hindrance. These formats are somewhat vague about datatypes, so you have to be careful with things like numbers and binary strings.
-- **Binary schema-driven formats** like Protocol Buffers and Avro allow compact, efficient encoding with clearly defined forward and backward compatibility semantics. The schemas can be useful for documentation and code generation in statically typed languages. However, these formats have the downside that data needs to be decoded before it is human-readable.
+- **Textual formats** like JSON, XML, and CSV are widespread, and their compatibility depends on how you use them. They have optional schema languages (JSON Schema, XML Schema), which are sometimes helpful and sometimes a hindrance. These formats are somewhat vague about datatypes, so you have to be careful with things like numbers and binary strings.
+- **Binary schema-driven formats** like Protocol Buffers and Avro allow compact, efficient encoding with clearly defined forward and backward compatibility semantics (see the unified compatibility table in §2.2). The schemas can be useful for documentation and code generation in statically typed languages. However, these formats have the downside that data needs to be decoded before it is human-readable.
 
-```mermaid
-graph TB
-    subgraph "Modes of Dataflow"
-        DB["Databases:<br/>Writer encodes,<br/>reader decodes"]
-        RPC["RPC & REST APIs:<br/>Request/response<br/>compatibility"]
-        WF["Durable Workflows:<br/>Temporal/Restate<br/>exactly-once execution"]
-        EVT["Event Systems:<br/>Message brokers<br/>and actors"]
-    end
-
-    style DB fill:#90EE90
-    style RPC fill:#87CEEB
-    style WF fill:#DDA0DD
-    style EVT fill:#ffeb3b
-```
-
-We also discussed several modes of dataflow, illustrating different scenarios in which data encodings are important:
-
+**Modes of dataflow recap**:
 - **Databases**: The process writing to the database encodes the data and the process reading from the database decodes it. *Data outlives code.*
 - **RPC and REST APIs**: The client encodes a request, the server decodes the request and encodes a response, and the client finally decodes the response. Servers are typically deployed first, clients second, so you need backward compatibility on requests and forward compatibility on responses.
 - **Durable execution and workflows**: Multi-step service interactions log RPC calls to durable storage for exactly-once semantics — a new addition that requires careful attention to determinism.
 - **Event-driven architectures** (using message brokers or actors): Nodes communicate by sending each other messages that are encoded by the sender and decoded by the recipient.
 
-We can conclude that with a bit of care, backward/forward compatibility and rolling upgrades are quite achievable. May your application's evolution be rapid and your deployments be frequent.
-
-```mermaid
-graph LR
-    subgraph "Key Takeaways"
-        T1["Backward + forward<br/>compatibility enable<br/>rolling deployments"]
-        T2["Schemas + tagged fields<br/>let you evolve formats<br/>without breaking old readers"]
-        T3["RPC hides network<br/>unreliability — be careful"]
-        T4["Durable execution +<br/>event-driven systems<br/>extend dataflow patterns"]
-    end
-
-    style T1 fill:#90EE90
-    style T2 fill:#90EE90
-    style T3 fill:#FFA500
-    style T4 fill:#DDA0DD
-```
+With a bit of care, backward/forward compatibility and rolling upgrades are quite achievable. May your application's evolution be rapid and your deployments be frequent.
 
 ---
 
 **Next**: [Chapter 6: Replication](./chapter-06-replication.md) - Keeping copies of data on multiple machines
 
-**Previous**: [Chapter 4: Encoding and Evolution](./chapter-04-encoding-evolution.md)
+**Previous**: [Chapter 4: Storage and Retrieval](./chapter-04-storage-retrieval.md)

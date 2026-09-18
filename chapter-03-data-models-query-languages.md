@@ -1,8 +1,18 @@
 # Chapter 3: Data Models and Query Languages
 
+## TL;DR
+
+- Every data system sits on top of a data model; choosing one shapes query language, performance, and schema evolution strategy.
+- Relational (SQL) handles structured data and joins well; the document model (JSON) handles self-contained tree-structured records with locality and schema flexibility.
+- Graph models (property graphs, triple stores) and query languages (Cypher, SPARQL, Datalog) win when relationships are many-to-many and traversals are deep and variable-length.
+- Schema-on-read (document) vs. schema-on-write (relational) is a trade-off between migration friction and write-time validation — see §5 for the canonical discussion.
+- Event sourcing with CQRS separates a write-optimized event log from read-optimized materialized views, useful for complex business domains and auditability.
+
+---
+
 ## Introduction
 
-Data models sit at the heart of every data system. They define how we structure information, how we query it, and ultimately how we reason about the problem domain. In a complex application, layers of abstraction stack on top of each other, with each layer hiding the complexity of the layers below it by providing a clean data model.
+Data models sit at the heart of every data system. They define how we structure information, how we query it, and how we reason about the problem domain. In a complex application, layers of abstraction stack on top of each other, with each layer hiding the complexity of the layers below it by providing a clean data model.
 
 ```mermaid
 graph TB
@@ -264,6 +274,8 @@ db.users.aggregate([
 ])
 ```
 
+> Schema-on-read vs. schema-on-write — relational databases enforce structure on writes, document databases interpret it on reads. The canonical treatment (with definitions and trade-offs) is in §5.
+
 ### Trade-offs of Normalization
 
 In the résumé example, `region_id` is a reference to a standardized set of regions, but `organization` and `school_name` are plain strings (denormalized). Many people may have worked at the same company, but there is no ID linking them.
@@ -302,22 +314,7 @@ graph LR
 
 You can think of denormalization as a form of **derived data**, since you need a process for updating the redundant copies.
 
-**Example: Twitter's Home Timelines** — In the social network case study, the join between posts and follows is too expensive, so Twitter precomputes and materializes timelines. The fan-out process that inserts a new post into followers' timelines is how the denormalized representation is kept consistent.
-
-```mermaid
-graph LR
-    POST["New Post<br/>(sender_id, text, ...)"]
-    POST -->|"fan-out<br/>service"| TIMELINE1["Follower A<br/>timeline"]
-    POST -->|"fan-out<br/>service"| TIMELINE2["Follower B<br/>timeline"]
-    POST -->|"fan-out<br/>service"| TIMELINE3["Follower C<br/>timeline"]
-
-    style POST fill:#90EE90
-    style TIMELINE1 fill:#87CEEB
-    style TIMELINE2 fill:#87CEEB
-    style TIMELINE3 fill:#87CEEB
-```
-
-X (formerly Twitter) doesn't store the *full text* of each post in the materialized timeline; instead, each entry stores only the **post ID**, the **sender ID**, and small bits of identifying information for reposts and replies [Krikorian, QCon 2012]. This is essentially a precomputed result of:
+**Example: Twitter's Home Timelines** — Twitter precomputes and materializes follower timelines because the join between posts and follows is too expensive at read time; see [Chapter 2](./chapter-02-defining-nonfunctional-requirements.md) for the full fan-out case study [Krikorian, QCon 2012]. The materialized timelines store only the **post ID**, the **sender ID**, and small bits of identifying information for reposts and replies:
 
 ```sql
 SELECT posts.id, posts.sender_id FROM posts
@@ -327,7 +324,7 @@ ORDER BY posts.timestamp DESC
 LIMIT 1000;
 ```
 
-When the timeline is read, the service still performs two joins: it looks up the post ID to fetch the actual post content (and like/reply counts), and it looks up the sender's profile to get username, profile picture, etc. This process of looking up human-readable information by ID is called **hydrating the IDs** — essentially a join performed in application code.
+When the timeline is read, the service still performs two joins: it looks up the post ID to fetch the actual post content (and like/reply counts), and it looks up the sender's profile to get username, profile picture, etc. This process of looking up human-readable information by ID is called **hydrating the IDs** — a join performed in application code.
 
 > **Why store only IDs in the materialized timeline?** The data they refer to is fast-changing. Like counts may change multiple times per second on a popular post; users regularly change usernames and profile photos. The timeline should show the *latest* count and picture when viewed, so denormalizing these into the timeline itself would not make sense. Storing IDs keeps the materialized timeline small and current.
 
@@ -849,20 +846,6 @@ MATCH
 RETURN person.name
 ```
 
-The query can be read as:
-
-```mermaid
-graph TB
-    L["Find any vertex 'person' such that:"]
-    L --> A["person has BORN_IN edge<br/>to a location in the US<br/>(via zero or more WITHIN edges)"]
-    L --> B["person also has LIVES_IN edge<br/>to a location in Europe"]
-    L --> R["Return person.name"]
-
-    style L fill:#90EE90
-    style A fill:#87CEEB
-    style B fill:#DDA0DD
-```
-
 The `[:WITHIN*0..]` expression means "follow a `WITHIN` edge, zero or more times" — like the `*` operator in a regular expression.
 
 There are several possible ways to execute the query. The description suggests scanning all people, examining each birthplace and residence, and returning only those meeting the criteria. But equivalently, you could start with the two `Location` vertices and work backward: with an index on the `name` property, efficiently find the US and Europe vertices, follow all incoming `WITHIN` edges to find states/regions/cities, then look for people via incoming `BORN_IN` or `LIVES_IN` edges at those locations.
@@ -873,7 +856,7 @@ There are several possible ways to execute the query. The description suggests s
 
 Graph data can be represented in a relational database (as we just saw), but can we query it with SQL? **Yes, but with difficulty.** Every edge traversed in a graph query is effectively a join with the edges table. In a relational database you usually know in advance which joins you need; in a graph query you may need to traverse a variable number of edges.
 
-The `() -[:WITHIN*0..]-> ()` pattern in Cypher expresses a **variable-length traversal**. In SQL, this requires recursive common table expressions (the `WITH RECURSIVE` syntax). The same query becomes ~30 lines of SQL:
+The `() -[:WITHIN*0..]-> ()` pattern in Cypher expresses a **variable-length traversal**. In SQL, this requires recursive common table expressions (the `WITH RECURSIVE` syntax). The same query becomes 36 lines of SQL:
 
 ```sql
 WITH RECURSIVE
@@ -917,15 +900,15 @@ JOIN lives_in_europe ON vertices.vertex_id = lives_in_europe.vertex_id;
 graph LR
     subgraph "Query Complexity"
         C["4-line Cypher query"]
-        S["31-line SQL query"]
-        C -->|"2x diff"| S
+        S["36-line SQL query"]
+        C -->|"9x diff"| S
     end
 
     style C fill:#90EE90
     style S fill:#ffcccc
 ```
 
-> **The fact that a 4-line Cypher query requires 31 lines in SQL shows how much of a difference the right choice of data model and query language can make.** This is just the beginning; there are more details to consider around handling cycles and choosing between breadth-first and depth-first traversal [Tisiot, 2021].
+> **The fact that a 4-line Cypher query requires 36 lines in SQL shows how much of a difference the right choice of data model and query language can make.** This is just the beginning; there are more details to consider around handling cycles and choosing between breadth-first and depth-first traversal [Tisiot, 2021].
 
 Other SQL extensions for recursive queries include Oracle's **hierarchical queries**. Other graph query languages include TigerGraph's GSQL and the **Property Graph Query Language (PGQL)** [van Rest et al., 2016]. The **Graph Query Language (GQL)** ISO standard, based on Cypher, was published in 2024 [Rathle & Bebee, 2024; Deutsch et al., 2022; Green, 2019].
 
@@ -1012,7 +995,7 @@ Turtle is a way of encoding data in the **Resource Description Framework (RDF)**
 </rdf:RDF>
 ```
 
-RDF has a few quirks because it's designed for internet-wide data exchange: subjects, predicates, and objects are often **URIs** (e.g., `<http://my-company.com/namespace#within>`) so that you can combine your data with someone else's without conflict if they use different meanings for the same word. The URL doesn't need to resolve to anything; from RDF's perspective it's simply a namespace.
+RDF has a few quirks because it's designed for internet-wide data exchange: subjects, predicates, and objects are often **URIs** (e.g., `<http://my-company.com/namespace#within>`) so that you can combine your data with someone else's without conflict if they use different meanings for the same word. The URL doesn't need to resolve to anything; from RDF's perspective it's a namespace.
 
 ### The SPARQL Query Language
 
@@ -1359,25 +1342,6 @@ print(f"Rebuilt view available seats: {view2.seats_available()}")  # 75
 
 ### Advantages of Event Sourcing and CQRS
 
-```mermaid
-graph TB
-    A1["✓ Events communicate intent<br/>('booking canceled' vs.<br/>'UPDATE bookings SET active=false')"]
-    A2["✓ Reproducible views:<br/>delete & recompute from log"]
-    A3["✓ Multiple read-optimized<br/>materialized views"]
-    A4["✓ Easy evolution:<br/>new views from old events"]
-    A5["✓ Compensating events<br/>for corrections"]
-    A6["✓ Audit log for compliance"]
-    A7["✓ High write throughput<br/>(sequential, log-shaped)"]
-
-    style A1 fill:#90EE90
-    style A2 fill:#90EE90
-    style A3 fill:#90EE90
-    style A4 fill:#90EE90
-    style A5 fill:#90EE90
-    style A6 fill:#90EE90
-    style A7 fill:#90EE90
-```
-
 - **Intent is clearer**: "the booking was canceled" is easier to understand than "row 4001's `active` column was set to false, three rows were deleted from `seat_assignments`, and a refund row was inserted into `payments`"
 - **Reproducibility**: Materialized views are derived from the event log in a reproducible way. Always delete the view and recompute by processing the same events in the same order with the same code. If there was a bug in view maintenance, fix it and rebuild.
 - **Multiple views**: Different materialized views optimized for particular queries, using any data model, stored anywhere. They can be denormalized for fast reads, or kept only in memory (recomputed from the log at startup).
@@ -1409,206 +1373,29 @@ You can implement event sourcing on top of any database, but some systems are de
 
 ---
 
-## 14. DataFrames, Matrices, and Arrays
+## 14. DataFrames, Matrices, and Arrays (sidebar)
 
-The data models discussed so far are used for both transaction processing and analytics. There are also a few data models you will likely encounter in an analytical or scientific context but rarely in OLTP systems: **DataFrames** and multidimensional arrays of numbers (matrices).
+> **Sidebar — orthogonal to the relational/document/graph focus of this chapter.** The **DataFrame** data model is supported by the **R language**, the **Pandas library** for Python, **Apache Spark**, **ArcticDB**, **Dask**, and other systems. DataFrames are a popular tool for data scientists preparing data for ML models; they are also widely used for data exploration, statistical data analysis, and visualization.
 
-The **DataFrame** data model is supported by the **R language**, the **Pandas library** for Python, **Apache Spark**, **ArcticDB**, **Dask**, and other systems. DataFrames are a popular tool for data scientists preparing data for ML models; they are also widely used for data exploration, statistical data analysis, and visualization.
-
-At first glance, a DataFrame is similar to a relational table or spreadsheet. A DataFrame supports relational-like operators for bulk operations on its contents:
-
-- Applying a function to all rows
-- Filtering rows based on a condition
-- Grouping rows by some columns and aggregating others
-- Joining (called **merge** in DataFrame-speak) rows from one DataFrame with another
-
-```mermaid
-graph TB
-    DF["DataFrame<br/>(tabular, in-memory)"]
-
-    DF --> O1["Apply functions"]
-    DF --> O2["Filter rows"]
-    DF --> O3["Group by + Aggregate"]
-    DF --> O4["Merge (join)"]
-
-    style DF fill:#90EE90
-```
-
-> Instead of using a declarative query language like SQL, a DataFrame is generally manipulated through a series of commands that modify its structure and content. This matches the typical workflow of data scientists, who incrementally "wrangle" data into a form that allows them to find answers to their questions. These manipulations usually take place on the data scientist's private copy, often on their local machine.
-
-DataFrame APIs also offer operations that go far beyond what relational databases provide, and the data model is often used in very different ways from typical relational data modeling [Petersohn et al., 2020]. For example, a common use is to transform data from a relational-like representation into a matrix or multidimensional array — the form in which many ML algorithms expect their input.
-
-### From Relational Table to Matrix
-
-A simple example: a relational table of user ratings of movies (1 to 5) on the left, transformed into a matrix on the right, where each column is a movie and each row is a user (similar to a pivot table).
+A DataFrame supports relational-like operators for bulk operations on its contents: applying a function to all rows, filtering, grouping + aggregating, and joining (called **merge**) [Petersohn et al., 2020]. DataFrame APIs also offer operations beyond relational databases — for example, transforming a relational-like representation into a **matrix** or multidimensional array, the form many ML algorithms expect.
 
 ```mermaid
 graph LR
-    subgraph "Relational (Long Format)"
-        T["user_id, movie_id, rating<br/>1, 1, 5<br/>1, 3, 4<br/>2, 1, 3<br/>2, 2, 4<br/>3, 2, 5<br/>3, 3, 2"]
-    end
-
-    subgraph "Matrix (Wide Format)"
-        M["            Movie1 Movie2 Movie3<br/>User1   [   5      -      4  ]<br/>User2   [   3      4      -  ]<br/>User3   [   -      5      2  ]"]
-    end
-
-    T -->|"pivot / sparse matrix"| M
+    T["Relational (Long Format)<br/>user_id, movie_id, rating<br/>1, 1, 5<br/>1, 3, 4<br/>2, 1, 3<br/>..."] -->|"pivot / sparse matrix"| M["Matrix (Wide Format)<br/>Movie1 Movie2 Movie3<br/>User1   [   5      -      4  ]<br/>..."]
 
     style T fill:#87CEEB
     style M fill:#DDA0DD
 ```
 
-The matrix is **sparse** (many missing values), which is fine. It may have many thousands of columns and would not fit well in a relational database, but DataFrames and libraries like NumPy can handle such data easily.
+Matrices are **sparse** (many missing values) and may have thousands of columns — fine for DataFrames and NumPy, but a poor fit for relational tables. Categorical values become numbers via **one-hot encoding** (a column per value, 1 where the category applies, 0 elsewhere). Once data is a matrix of numbers, **linear algebra operations** underpin many ML algorithms.
 
-### From Data to ML-Ready Numbers
-
-A matrix can contain only numbers. Various techniques transform non-numerical data into numbers:
-
-- **Dates**: Scale to floating-point numbers within a suitable range
-- **Categorical values** (e.g., movie genre): Use **one-hot encoding** — create a column for each possible value ("comedy", "drama", "horror"), and for each movie put a 1 in the column for its genre and 0 in all others. This generalizes to movies in multiple genres.
-
-Once the data is a matrix of numbers, it's amenable to **linear algebra operations**, which form the basis of many ML algorithms. The data could be part of a movie recommendation system.
-
-### Example: Pandas-Style DataFrame Workflow
-
-```python
-import pandas as pd
-import numpy as np
-
-
-# Simulated movie ratings data (relational-like)
-ratings = pd.DataFrame({
-    "user_id": [1, 1, 2, 2, 3, 3],
-    "movie_id": [1, 3, 1, 2, 2, 3],
-    "rating":  [5, 4, 3, 4, 5, 2],
-    "genre":   ["drama", "comedy", "drama",
-                "action", "action", "comedy"],
-})
-
-# 1. Filter rows: high ratings only
-high_ratings = ratings[ratings["rating"] >= 4]
-
-# 2. Group by movie and aggregate
-movie_stats = (ratings
-               .groupby("movie_id")
-               .agg(avg_rating=("rating", "mean"),
-                    num_ratings=("rating", "count")))
-
-# 3. Merge with a movies table (relational-style join)
-movies = pd.DataFrame({
-    "movie_id": [1, 2, 3],
-    "title":    ["Dune", "Mad Max", "Barbie"],
-    "year":     [2021, 2015, 2023],
-})
-joined = movie_stats.merge(movies, on="movie_id")
-
-# 4. Pivot to a matrix (wide format) for ML
-user_movie_matrix = ratings.pivot_table(
-    index="user_id",
-    columns="movie_id",
-    values="rating",
-)
-print(user_movie_matrix)
-# movie_id    1    2    3
-# user_id
-# 1          5.0  NaN  4.0
-# 2          3.0  4.0  NaN
-# 3          NaN  5.0  2.0
-
-# 5. One-hot encode the genre for ML input
-genre_oh = pd.get_dummies(ratings["genre"], prefix="genre")
-ratings_encoded = pd.concat([ratings[["user_id", "movie_id", "rating"]],
-                              genre_oh], axis=1)
-
-# 6. Convert to a NumPy matrix for linear algebra
-matrix = ratings_encoded.fillna(0).to_numpy()
-print(f"ML-ready matrix shape: {matrix.shape}")
-```
-
-DataFrames are flexible enough to allow data to be gradually evolved from a relational form into a matrix representation, giving the data scientist control over the representation most suitable for the analysis or model training process.
-
-### Specialized Array Databases
-
-Some databases specialize in storing large multidimensional arrays of numbers; these are called **array databases** and are most commonly used for scientific datasets:
-
-- **Geospatial measurements** (raster data on a regularly spaced grid)
-- **Medical imaging**
-- **Observations from astronomical telescopes**
-
-Examples include **TileDB** [Papadopoulos et al., 2016]. DataFrames are also used in the financial industry for representing time-series data (asset prices and trades over time), where **ArcticDB** (developed by Bloomberg and Man Group) is a notable recent example [Targett, 2023]. Because of their popularity with data scientists, DataFrames have been added to batch processing frameworks such as **Spark** and **Flink** (we will return to this topic in Chapter 11).
+Some databases specialize in storing large multidimensional arrays of numbers — **array databases** — used for geospatial rasters, medical imaging, and astronomical observations; **TileDB** [Papadopoulos et al., 2016] is a notable example. **ArcticDB** (Bloomberg and Man Group) targets time-series financial data [Targett, 2023]. DataFrames are also added to batch processing frameworks such as **Spark** and **Flink** (Chapter 11).
 
 ---
 
 ## 15. Summary
 
-Data models are a huge subject, and in this chapter we have taken a quick look at a broad variety of models. We didn't have space to go into all the details of each, but hopefully the overview has been enough to whet your appetite to find out more about the model that best fits your application's requirements.
-
-```mermaid
-graph TB
-    subgraph "Data Model Selection"
-        R["Relational Model<br/>+ SQL<br/>(tables, joins,<br/>strong schema)"]
-        D["Document Model<br/>+ JSON<br/>(self-contained<br/>documents)"]
-        G["Graph Model<br/>+ Cypher/SPARQL/<br/>Datalog<br/>(highly connected<br/>data)"]
-        E["Event Sourcing<br/>+ CQRS<br/>(append-only log,<br/>materialized views)"]
-        F["DataFrames<br/>+ Matrices<br/>(ML, statistics,<br/>arrays)"]
-    end
-
-    subgraph "Best Fits"
-        R -->|"data warehousing,<br/>business analytics"| BF1["Star/snowflake<br/>schemas"]
-        D -->|"self-contained JSON,<br/>tree-structured data"| BF2["Schemaless,<br/>locality"]
-        G -->|"many-to-many,<br/>deep traversals"| BF3["Graph queries"]
-        E -->|"complex business<br/>domains"| BF4["Audit log,<br/>evolvability"]
-        F -->|"ML pipelines,<br/>scientific data"| BF5["NumPy,<br/>Spark"]
-    end
-
-    style R fill:#87CEEB
-    style D fill:#90EE90
-    style G fill:#DDA0DD
-    style E fill:#FFD700
-    style F fill:#FFB6C1
-```
-
-### Key Takeaways
-
-**The relational model**, despite being more than half a century old, remains an important data model for many applications — especially in data warehousing and business analytics, where relational star or snowflake schemas and SQL queries are ubiquitous. However, several alternatives have become popular in other domains:
-
-- **The document model** targets use cases where data comes in self-contained JSON documents and where relationships between documents are rare.
-- **Graph data models** go in the opposite direction, targeting use cases where anything is potentially related to everything and queries potentially need to traverse multiple hops (a need met by recursive queries in Cypher, SPARQL, or Datalog).
-- **DataFrames** generalize relational data to large numbers of columns, providing a bridge between databases and the multidimensional arrays that form the basis of much machine learning, statistical data analysis, and scientific computing.
-
-To some degree, **one model can often be emulated in terms of another** — graph data can be represented in a relational database, but the result can be awkward (as we saw with recursive queries in SQL). Various specialist databases have been developed for each data model, providing query languages and storage engines optimized for that model. However, there is also a trend for databases to expand into neighboring niches by adding support for other data models:
-
-- Relational databases have added JSON columns
-- Document databases have added relational-like joins
-- SQL support for graph data is gradually improving
-
-**Another model discussed is event sourcing**, which represents data as an append-only log of immutable events and can be advantageous for modeling activities in complex business domains. An append-only log is good for writing data (as we will see in Chapter 4); to support efficient queries, the event log is translated into read-optimized materialized views through CQRS.
-
-```mermaid
-graph LR
-    subgraph "Convergence Trend"
-        RDB["Relational DBs"] -->|"+ JSON columns,<br/>+ GQL extensions"| CONV["Relational–Document<br/>Hybrids"]
-        DOC["Document DBs"] -->|"+ joins,<br/>+ secondary indexes"| CONV
-        SQL["SQL:2011+"] -->|"+ recursive CTEs,<br/>+ property graph queries"| CONV
-    end
-
-    style RDB fill:#87CEEB
-    style DOC fill:#90EE90
-    style SQL fill:#DDA0DD
-    style CONV fill:#FFD700
-```
-
-> **Schema flexibility**: One thing nonrelational data models have in common is that they typically **don't enforce a schema** for the data they store, which can make it easier to adapt applications to changing requirements. However, your application most likely still assumes that data has a certain structure; it's just a question of whether the schema is **explicit** (enforced on write) or **implicit** (assumed on read).
-
-### Unmentioned Data Models
-
-Although we have covered a lot of ground, some data models remain unmentioned:
-
-- **Genome data** — Researchers working with genome data often need to perform **sequence similarity searches**, matching one very long string (representing a DNA molecule) against a large database of similar but not identical strings. Specialized genome database software like **GenBank** [Benson et al., 2008] handles this.
-- **Double-entry ledgers** — Many financial systems use ledgers with double-entry accounting as their data model. This can be represented in relational databases, but specialized databases like **TigerBeetle** exist. Cryptocurrencies and blockchains are based on **distributed ledgers**, which also have value transfer built in.
-- **Full-text search** — Arguably a kind of data model that is frequently used alongside databases. Information retrieval is a large specialist subject we won't cover in great detail, but we will touch on search indexes and vector search in "Full-Text Search" (Chapter 5 / page 146).
-
-### Final Comparison Table
+The relational model, despite being more than half a century old, remains the default for structured data — star/snowflake schemas and SQL queries dominate data warehousing and business analytics. Document, graph, event-sourcing, and DataFrame models each target a different shape of data: tree-structured records, many-to-many traversals, complex evolving domains, and ML/statistics respectively. Databases are converging — relational adds JSON, document adds joins, SQL gains recursive CTEs and property-graph extensions — so hybrids are increasingly common. Across all non-relational models, schemas are usually **implicit (assumed on read)** rather than **explicit (enforced on write)** [Awadallah, 2009; Fowler, 2013]. Specialized data models not covered in depth here include **genome data** (sequence similarity search; e.g., GenBank [Benson et al., 2008]), **double-entry ledgers** (e.g., TigerBeetle; blockchains), and **full-text search** (covered in Chapter 4).
 
 | Aspect | Relational | Document | Graph | Event Sourcing | DataFrames |
 |--------|-----------|----------|-------|----------------|------------|
@@ -1620,29 +1407,10 @@ Although we have covered a lot of ground, some data models remain unmentioned:
 | **Strengths** | ACID, mature, joins | Locality, flexibility | Traversal, expressiveness | Reproducibility, evolvability | ML pipeline, sparse data |
 | **Examples** | PostgreSQL, MySQL | MongoDB, Couchbase | Neo4j, Neptune, KùzuDB | EventStoreDB, Kafka | Pandas, Spark, Dask |
 
-```mermaid
-graph TB
-    subgraph "Final Selection Guidance"
-        S1["Tree-like data,<br/>loaded as a whole?<br/>→ Document DB"]
-        S2["Highly connected,<br/>deep traversals?<br/>→ Graph DB"]
-        S3["Complex joins,<br/>structured data,<br/>strong schema?<br/>→ Relational DB"]
-        S4["Complex domain,<br/>need audit,<br/>evolving views?<br/>→ Event Sourcing"]
-        S5["ML, statistics,<br/>matrix data?<br/>→ DataFrames"]
-        S6["Still not sure?<br/>Start with relational;<br/>add others as needed"]
-    end
-
-    style S1 fill:#90EE90
-    style S2 fill:#DDA0DD
-    style S3 fill:#87CEEB
-    style S4 fill:#FFD700
-    style S5 fill:#FFB6C1
-    style S6 fill:#ffeb3b
-```
-
-We have to leave it there for now. In the next chapter, we will discuss some of the trade-offs that come into play when implementing the data models described here.
+**Selection guidance:** tree-like data loaded as a whole → Document DB; highly connected, deep traversals → Graph DB; complex joins, structured data, strong schema → Relational DB; complex domain, audit, evolving views → Event Sourcing; ML, statistics, matrix data → DataFrames. When in doubt, start with relational and add others as needed.
 
 ---
 
 **Next**: [Chapter 4: Storage and Retrieval](./chapter-04-storage-and-retrieval.md) - How databases store data on disk and retrieve it efficiently
 
-**Previous**: [Chapter 2: Data Models and Query Languages (1st Edition Notes)](./chapter-02-data-models-query-languages.md) - The original 1st-edition version of this chapter
+**Previous**: [Chapter 2: Defining Nonfunctional Requirements](./chapter-02-defining-nonfunctional-requirements.md) - Reliability, scalability, and maintainability trade-offs

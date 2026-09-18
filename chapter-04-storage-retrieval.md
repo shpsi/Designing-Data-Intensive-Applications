@@ -1,13 +1,19 @@
 # Chapter 4: Storage and Retrieval
 
+## TL;DR
+
+- The two main families of storage engines serve different query patterns: **OLTP** engines (B-trees, LSM-trees) optimize for small read/write requests on a handful of records; **OLAP** engines (column-oriented) optimize for scans that aggregate over millions of rows.
+- For OLTP, two dominant structures: **B-trees** break the database into fixed-size pages and overwrite in place, with a write-ahead log (WAL) for crash recovery. **LSM-trees** (Log-Structured Merge-trees) append to a memtable plus an on-disk log, then flush immutable sorted SSTables that are merged in the background. Both keep keys sorted to support range queries.
+- **Indexes** are a read-write trade-off: more indexes speed up reads but slow down writes and consume disk space. Hash indexes give O(1) point lookups but no range queries; sorted structures (SSTables, B-trees) handle both.
+- For OLAP, **column-oriented storage** reads only the columns a query needs, compresses well (bitmap encoding, run-length encoding), and pairs with **vectorized or compiled query execution** for throughput.
+- Specialized indexes extend the basic model: **R-trees / Bkd-trees** for geospatial queries, **inverted indexes** for full-text search, and **HNSW / IVF** for vector similarity search (central to RAG and semantic search).
+- Cloud data warehouses decouple storage (object storage) from compute (serverless query engine), enabling elastic scaling. Materialized views and data cubes accelerate repeated analytical queries.
+
 ## Introduction
 
 On the most fundamental level, a database needs to do two things: when you give it data, it should **store** the data; and when you ask it later, it should **retrieve** the data for you. The previous chapter looked at data models and query languages; this chapter digs into how those models are mapped onto disk and memory.
 
-Two very different families of storage engines have emerged:
-
-- **OLTP** (Online Transaction Processing) — optimized for a high volume of small read/write requests, each touching a handful of records, with low response-time requirements.
-- **OLAP** (Online Analytical Processing) — optimized for complex queries that scan millions of rows and aggregate them, where throughput matters more than latency.
+Two very different families of storage engines have emerged — **OLTP** (Online Transaction Processing) optimized for a high volume of small read/write requests, each touching a handful of records, with low response-time requirements, and **OLAP** (Online Analytical Processing) optimized for complex queries that scan millions of rows and aggregate them, where throughput matters more than latency. For the broader trade-offs behind these two categories, see Chapter 1.
 
 ```mermaid
 graph TB
@@ -110,48 +116,6 @@ graph TB
 
 **Key insight**: Well-chosen indexes speed up reads but consume disk space and slow down writes. Databases typically do not index everything by default — you must choose indexes based on the application's typical query patterns.
 
-### Python: A Log-Style Key-Value Store
-
-```python
-import os
-from typing import Optional
-
-class LogKVStore:
-    """A minimal append-only key-value store with linear scans."""
-
-    def __init__(self, path: str = "database.txt"):
-        self.path = path
-        # Ensure file exists
-        if not os.path.exists(self.path):
-            open(self.path, 'w').close()
-
-    def set(self, key: str, value: str) -> None:
-        """Append a new key-value pair to the log."""
-        # Comma-separated; in real life you'd escape commas in keys/values
-        with open(self.path, 'a', encoding='utf-8') as f:
-            f.write(f"{key},{value}\n")
-
-    def get(self, key: str) -> Optional[str]:
-        """Return the most recent value for a key, scanning the whole file."""
-        latest: Optional[str] = None
-        prefix = f"{key},"
-        with open(self.path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.startswith(prefix):
-                    # Take everything after the first comma
-                    latest = line[len(prefix):].rstrip("\n")
-        return latest
-
-# Usage
-store = LogKVStore()
-store.set("12", '{"name":"London"}')
-store.set("42", '{"name":"San Francisco"}')
-store.set("42", '{"name":"San Francisco","updated":true}')
-print(store.get("42"))  # The most recent value wins
-```
-
-This is intentionally simple: O(1) writes, O(n) reads. The remaining sections add indexes to make reads faster.
-
 ---
 
 ## 2. Hash Indexes
@@ -245,9 +209,11 @@ graph TB
     style MERGE fill:#DDA0DD
 ```
 
+**Write-ahead log (WAL)**: a separate append-only file on disk into which every modification is written and flushed (`fsync`) *before* the in-memory data structure is updated. If the database crashes, the WAL is replayed on restart to restore any modifications that did not yet reach disk-resident state. The WAL is what makes the in-memory memtable durable without flushing it on every write. B-trees use the same idea (see §4).
+
 **Write path**:
 1. Add the write to an in-memory balanced tree (the **memtable**)
-2. Also append to a write-ahead log for crash recovery
+2. Also append to the write-ahead log for crash recovery
 3. When the memtable exceeds a threshold (typically a few MB), write it out as a sorted SSTable
 4. Serve reads by checking the memtable first, then SSTables from newest to oldest
 
@@ -261,7 +227,7 @@ graph TB
 - If the same key appears in multiple inputs, keep only the most recent value
 - Deletions use a **tombstone** marker that tells the merge process to drop previous values
 
-This algorithm is essentially what **RocksDB**, **Cassandra**, **ScyllaDB**, and **HBase** all do — all inspired by Google's **Bigtable** paper (2006), which introduced the terms SSTable and memtable. The technique was originally published in 1996 as the **Log-Structured Merge-tree (LSM-tree)**.
+This algorithm is what **RocksDB**, **Cassandra**, **ScyllaDB**, and **HBase** all do — all inspired by Google's **Bigtable** paper (2006), which introduced the terms SSTable and memtable. The technique was originally published in 1996 as the **Log-Structured Merge-tree (LSM-tree)**.
 
 ```mermaid
 sequenceDiagram
@@ -406,7 +372,7 @@ This algorithm keeps the tree **balanced**: a B-tree with n keys has depth O(log
 
 Overwriting a page in place is dangerous during a crash. If only some pages have been written during a split, you can end up with an orphan page or a **torn page** (partially written).
 
-To guard against this, B-tree implementations use a **write-ahead log (WAL)**: every modification is appended to the WAL and flushed to disk (via `fsync`) before being applied to the tree pages. On restart, the WAL is replayed to restore consistency. The equivalent in filesystems is called **journaling**.
+To guard against this, B-trees use a **write-ahead log (WAL)** — defined in §3 for LSM-trees — applying the same idea to page writes: every modification is appended to the WAL and flushed to disk (via `fsync`) before being applied to the tree pages. On restart, the WAL is replayed to restore consistency. The equivalent in filesystems is called **journaling**.
 
 ```mermaid
 graph LR
@@ -467,54 +433,16 @@ graph TB
     style L4 fill:#FFA500
 ```
 
-### Sequential vs Random Writes
-
-LSM-trees write entire segment files (megabytes) at a time, which is sequential. B-trees overwrite pages scattered across the disk (random writes).
-
-```mermaid
-graph LR
-    subgraph "B-Tree Writes"
-        BW["Many small,<br/>scattered overwrites<br/>→ random I/O"]
-    end
-
-    subgraph "LSM-Tree Writes"
-        LW["Few large,<br/>sequential appends<br/>→ sequential I/O"]
-    end
-
-    style BW fill:#ffcccc
-    style LW fill:#90EE90
-```
-
-Even on SSDs, sequential writes outperform random writes. Flash is read/written in 4 KiB pages but erased in 512 KiB blocks; random writes force the SSD controller to do more **garbage collection** (copying live pages out before erasing a block) and wear out the drive faster.
-
-### Write Amplification
+LSM-trees write entire segment files (megabytes) at a time, which is sequential. B-trees overwrite pages scattered across the disk (random writes). Even on SSDs, sequential writes outperform random writes. Flash is read/written in 4 KiB pages but erased in 512 KiB blocks; random writes force the SSD controller to do more **garbage collection** (copying live pages out before erasing a block) and wear out the drive faster.
 
 **Write amplification** = total bytes written to disk ÷ bytes you would have written in an append-only log with no index.
 
 - **B-trees**: at least 2x (WAL + page). Page splits can push it higher.
 - **LSM-trees**: writes are amplified by compaction (memtable → SSTable → merged SSTable → merged again). For typical workloads, LSM-trees have lower write amplification because they don't write whole pages and SSTables compress well.
 
-### Disk Space Usage
-
 B-trees fragment over time — deleted rows leave dead pages in the middle of the file that can't easily be returned to the OS (PostgreSQL's `VACUUM` reclaims them). LSM-trees don't have this problem because compaction rewrites SSTables anyway, and SSTable blocks compress better than B-tree pages.
 
 A subtle issue with LSM-trees: a deleted record may persist in higher levels until its tombstone is propagated through all compaction levels. Some specialist designs propagate deletions faster.
-
-```mermaid
-graph TB
-    subgraph "Immutable SSTable Snapshots"
-        S1["Snapshot at T1:<br/>record SSTable files at T1"]
-        S2["Snapshot at T2:<br/>record SSTable files at T2"]
-    end
-
-    subgraph "B-Tree Snapshots"
-        B1["Snapshot requires<br/>copying pages or<br/>complex versioning"]
-    end
-
-    style S1 fill:#90EE90
-    style S2 fill:#90EE90
-    style B1 fill:#ffcccc
-```
 
 Conversely, the **immutable** nature of SSTables makes cheap snapshots trivial: just record the list of files; don't delete any until the snapshot is no longer needed. B-trees, which overwrite pages, make this harder.
 
@@ -522,7 +450,7 @@ Conversely, the **immutable** nature of SSTables makes cheap snapshots trivial: 
 
 | Workload Property | B-Tree | LSM-Tree |
 |---|---|---|
-| **Write throughput** | Moderate | High |
+| **Write throughput** | Moderate (random page writes) | High (sequential segment writes) |
 | **Read latency** | Predictable, fast | May check multiple SSTables |
 | **Range scans** | Excellent | Good (parallel segment scan) |
 | **Point queries** | One page read | Multiple SSTables (Bloom filters help) |
@@ -677,33 +605,7 @@ Some databases (SQL Server, SAP HANA, SingleStore) try to do both transaction pr
 
 ### Cloud Data Warehouses
 
-Established vendors (Teradata, Vertica, SAP HANA) offer both on-premises and cloud deployments. New cloud-only warehouses (Google BigQuery, Amazon Redshift, Snowflake) have become widely adopted because they leverage scalable cloud infrastructure: object storage for data, serverless compute for queries, elastic scaling.
-
-```mermaid
-graph TB
-    subgraph "Cloud Warehouse Architecture"
-        OBJ["Object Storage<br/>(S3, GCS, Azure Blob)<br/>columnar files"]
-        CAT["Data Catalog<br/>Polaris, Unity Catalog"]
-        ENG["Query Engine<br/>(serverless<br/>compute pool)"]
-        META["Table Format<br/>Iceberg, Delta<br/>time travel, GC"]
-    end
-
-    subgraph "Decoupled Resources"
-        SCALE["Scale storage<br/>independently"]
-        COMPUTE["Scale compute<br/>independently"]
-    end
-
-    OBJ <--> META
-    CAT --> META
-    ENG --> OBJ
-    ENG --> CAT
-    OBJ -.-> SCALE
-    ENG -.-> COMPUTE
-
-    style OBJ fill:#87CEEB
-    style ENG fill:#90EE90
-    style META fill:#ffeb3b
-```
+Established vendors (Teradata, Vertica, SAP HANA) offer both on-premises and cloud deployments. New cloud-only warehouses (Google BigQuery, Amazon Redshift, Snowflake) have become widely adopted because they leverage scalable cloud infrastructure: object storage for data, serverless compute for queries, elastic scaling. The deeper treatment of cloud-native architecture and the separation of storage and compute lives in Chapter 1; the rest of this section focuses on the storage-format choices those systems make.
 
 Cloud warehouses decouple **query computation** from the **storage layer**. Data persists in object storage rather than local disks, so storage capacity and compute resources can be adjusted independently.
 
@@ -998,7 +900,7 @@ In a real database, the bitmaps would be run-length encoded and operated on dire
 
 ## 10. Materialized Views and Data Cubes
 
-A **materialized view** is the actual, on-disk result of a query — unlike a virtual view, which is just a query shortcut expanded at execution time.
+A **materialized view** is the actual, on-disk result of a query — unlike a virtual view, which is just a query shortcut expanded at execution time. The trade-offs of keeping derived state and the operational discipline around derived data systems are treated more fully in Chapter 11.
 
 ```sql
 -- A materialized view
@@ -1255,26 +1157,11 @@ Early embedding models (Word2Vec, BERT, GPT) worked on text. Modern models are *
 
 ### Vector Indexes
 
-To search, the engine embeds the user's query and then finds documents whose embeddings are closest to the query vector. R-trees don't work well in high dimensions (the "curse of dimensionality"). Specialized vector indexes include:
+To search, the engine embeds the user's query and then finds documents whose embeddings are closest to the query vector. R-trees don't work well in high dimensions (the "curse of dimensionality"). Three main specialized vector index structures are used:
 
-```mermaid
-graph TB
-    subgraph "Vector Index Types"
-        FLAT["Flat Index<br/>compare every vector<br/>accurate but slow"]
-        IVF["IVF Index<br/>(Inverted File)<br/>cluster into centroids,<br/>check probes"]
-        HNSW["HNSW Index<br/>(Hierarchical Navigable<br/>Small World)<br/>multi-layer graph"]
-    end
-
-    style FLAT fill:#ffcccc
-    style IVF fill:#87CEEB
-    style HNSW fill:#90EE90
-```
-
-**Flat indexes** store vectors as-is and compare the query to every one. Slow but accurate.
-
-**IVF (Inverted File) indexes** cluster the vector space into partitions (centroids). At query time, the engine checks a configurable number of "probes" (nearby partitions). Faster than flat, but approximate — query and document may fall in different partitions even when close.
-
-**HNSW (Hierarchical Navigable Small World) indexes** keep multiple layers of the vector space, each represented as a graph where nodes are vectors and edges are proximity links. A query starts in the top layer (sparse, fast) and moves down, getting more precise at each layer.
+- **Flat indexes** store vectors as-is and compare the query to every one. Slow but accurate.
+- **IVF (Inverted File) indexes** cluster the vector space into partitions (centroids). At query time, the engine checks a configurable number of "probes" (nearby partitions). Faster than flat, but approximate — query and document may fall in different partitions even when close.
+- **HNSW (Hierarchical Navigable Small World) indexes** keep multiple layers of the vector space, each represented as a graph where nodes are vectors and edges are proximity links. A query starts in the top layer (sparse, fast) and moves down, getting more precise at each layer.
 
 ```mermaid
 graph TB
@@ -1364,41 +1251,10 @@ A real vector database uses HNSW or IVF to avoid the O(n) scan that this flat in
 
 This chapter dug into how databases store and retrieve data. The OLTP and OLAP worlds have very different storage engines:
 
-```mermaid
-graph TB
-    subgraph "OLTP Storage Engines"
-        O1["Row-oriented<br/>(data for one row together)"]
-        O2["B-trees or LSM-trees"]
-        O3["Optimized for point lookups<br/>and small range queries"]
-    end
-
-    subgraph "OLAP Storage Engines"
-        A1["Column-oriented<br/>(data for one column together)"]
-        A2["Compressed + vectorized"]
-        A3["Optimized for large scans<br/>and aggregations"]
-    end
-
-    style O2 fill:#90EE90
-    style A1 fill:#87CEEB
-```
-
 On the OLTP side, two main schools:
 
 - **Log-structured (LSM-trees)**: append-only files, immutable segments, background compaction. Higher write throughput, better compression. Examples: RocksDB, Cassandra, ScyllaDB, HBase, LevelDB.
 - **Update-in-place (B-trees)**: fixed-size pages, overwrite-in-place with WAL for crash recovery. Faster point reads, more predictable performance. Examples: PostgreSQL, MySQL InnoDB, Oracle, SQL Server.
-
-```mermaid
-graph TB
-    subgraph "Indexing Beyond Single-Key"
-        I1["Multidimensional (R-trees, Bkd-trees)<br/>geospatial queries"]
-        I2["Full-text (inverted indexes, n-grams)<br/>keyword + fuzzy search"]
-        I3["Vector (HNSW, IVF)<br/>semantic similarity search"]
-    end
-
-    style I1 fill:#87CEEB
-    style I2 fill:#DDA0DD
-    style I3 fill:#90EE90
-```
 
 Beyond key-value indexes, we saw:
 
@@ -1422,115 +1278,3 @@ As an application developer, understanding the internals of storage engines puts
 ---
 
 **References** in the book (Chapter 4) cover LSM-trees, B-trees, column stores, vector search, and the seminal Bigtable, C-Store, Dremel, and Snowflake papers, plus the HNSW paper by Malkov and Yashunin.
-
----
-
-## Appendix: Python Reference Implementations
-
-For convenience, here are all the small Python implementations from this chapter in one place.
-
-### A1. SSTable + Memtable Skeleton
-
-```python
-import bisect
-from typing import Optional, Tuple, List
-
-class MemTable:
-    """In-memory sorted key-value store (a small sorted dict)."""
-
-    def __init__(self):
-        self._data = {}
-
-    def set(self, key: str, value: str) -> None:
-        self._data[key] = value
-
-    def get(self, key: str) -> Optional[str]:
-        return self._data.get(key)
-
-    def items_sorted(self) -> List[Tuple[str, str]]:
-        return sorted(self._data.items())
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-
-class SSTable:
-    """An immutable sorted file of key-value pairs."""
-
-    def __init__(self, items: List[Tuple[str, str]]):
-        # Items are assumed pre-sorted by key
-        self.keys = [k for k, _ in items]
-        self.values = [v for _, v in items]
-
-    def get(self, key: str) -> Optional[str]:
-        # Binary search by key
-        i = bisect.bisect_left(self.keys, key)
-        if i < len(self.keys) and self.keys[i] == key:
-            return self.values[i]
-        return None
-
-    def range(self, lo: str, hi: str) -> List[Tuple[str, str]]:
-        """Yield keys in [lo, hi]."""
-        lo_i = bisect.bisect_left(self.keys, lo)
-        hi_i = bisect.bisect_right(self.keys, hi)
-        return list(zip(self.keys[lo_i:hi_i], self.values[lo_i:hi_i]))
-
-
-class LSMTree:
-    """A toy LSM-tree: memtable + on-disk SSTables."""
-
-    def __init__(self, flush_threshold: int = 100):
-        self.memtable = MemTable()
-        self.flush_threshold = flush_threshold
-        self.sstables: List[SSTable] = []
-
-    def set(self, key: str, value: str) -> None:
-        self.memtable.set(key, value)
-        if len(self.memtable) >= self.flush_threshold:
-            self._flush()
-
-    def _flush(self) -> None:
-        items = self.memtable.items_sorted()
-        self.sstables.append(SSTable(items))
-        self.memtable = MemTable()
-
-    def get(self, key: str) -> Optional[str]:
-        # 1. Check memtable
-        v = self.memtable.get(key)
-        if v is not None:
-            return v
-        # 2. Check SSTables newest to oldest
-        for sst in reversed(self.sstables):
-            v = sst.get(key)
-            if v is not None:
-                return v
-        return None
-
-# Usage
-db = LSMTree(flush_threshold=3)
-db.set("42", "San Francisco")
-db.set("12", "London")
-db.set("99", "Tokyo")     # triggers a flush
-db.set("42", "San Francisco v2")
-print(db.get("42"))        # -> "San Francisco v2"
-print(db.get("99"))        # -> "Tokyo"
-```
-
-### A2. Vectorized Filter on a Bitmap
-
-```python
-def bitmap_and(a: List[int], b: List[int]) -> List[int]:
-    """Bitwise AND on two equal-length bitmap lists (0/1)."""
-    return [x & y for x, y in zip(a, b)]
-
-def bitmap_or(a: List[int], b: List[int]) -> List[int]:
-    return [x | y for x, y in zip(a, b)]
-
-# Example: "WHERE product_sk = 'bananas' AND store_sk = 'store 3'"
-bananas_bitmap = [0, 0, 1, 0, 1, 1, 0, 1, 0]
-store3_bitmap  = [0, 1, 1, 1, 0, 1, 0, 1, 1]
-result = bitmap_and(bananas_bitmap, store3_bitmap)
-# -> [0, 0, 1, 0, 0, 1, 0, 1, 0]  (rows 2, 5, 7 match both conditions)
-```
-
-In a real engine, these operations would be done with SIMD instructions on packed bit arrays rather than Python lists of integers — but the principle is identical.

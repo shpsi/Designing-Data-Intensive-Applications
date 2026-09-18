@@ -1,8 +1,16 @@
 # Chapter 9: The Trouble with Distributed Systems
 
+## TL;DR
+
+- **Partial failures are the norm.** When software on one node tries to interact with another, it may succeed, fail silently, hang, or return conflicting information - and the caller often cannot tell which happened.
+- **Networks, clocks, and processes are all unreliable.** Packets are lost, reordered, duplicated, or delayed for unbounded times; hardware clocks drift and jump; threads can be paused for seconds or minutes by GC, VM suspension, paging, or context switches.
+- **There is no global knowledge.** A node only learns about others via messages on an unreliable network - its view of the world is a guess based on those messages.
+- **Use quorums and fencing tokens for important decisions.** A single node cannot be trusted; locks and leases need monotonically increasing tokens so a zombie leaseholder cannot corrupt shared state.
+- **Algorithms must declare their assumptions** (synchronous vs. asynchronous; crash-stop vs. crash-recovery) and be validated via model checking, fault injection, or deterministic simulation testing.
+
 ## Introduction
 
-In previous chapters, we've discussed replication (Chapter 5), partitioning (Chapter 6), and transactions (Chapter 7). These techniques help build reliable systems from unreliable components. However, we glossed over many problems that occur in distributed systems.
+In previous chapters, we've discussed replication (Chapter 6), partitioning (Chapter 7), and transactions (Chapter 8). These techniques help build reliable systems from unreliable components. However, we glossed over many problems that occur in distributed systems.
 
 Working with distributed systems is fundamentally different from writing software on a single computer. A program on a single computer either works or it doesn't - there is usually no middle ground. But in a distributed system, **partial failures** are the norm: some parts work, others don't, and you often cannot tell which is which.
 
@@ -94,6 +102,10 @@ def distributed_operation() -> str:
 This nondeterminism and possibility of partial failures is what makes distributed systems hard to work with. On the other hand, if a distributed system can tolerate partial failures, that opens up powerful possibilities - for example, we can perform a rolling upgrade, rebooting one node at a time to install software updates while the system as a whole continues working uninterrupted. **Fault tolerance** therefore allows us to make distributed systems more reliable than single-node systems; we can build a reliable system from unreliable components.
 
 > "In distributed systems, suspicion, pessimism, and paranoia pay off."
+
+### Knowledge Is a Guess
+
+A node in the network cannot know anything for sure about other nodes - it can only make guesses based on the messages it receives (or doesn't receive). A node can find out another node's state only by exchanging messages with it. If a remote node doesn't respond, there is no way of knowing its state. Fortunately, we don't need to resolve the philosophical questions this raises: we can **state the assumptions** we are making about behavior (the system model, discussed in §11) and design the actual system in such a way that it meets those assumptions. Algorithms can be proved to function correctly within a certain system model, so reliable behavior is achievable even if the underlying model provides very few guarantees.
 
 ---
 
@@ -403,41 +415,7 @@ UDP is a good choice when **delayed data is worthless**. In a VoIP call, there p
 
 ### Synchronous Versus Asynchronous Networks
 
-Distributed systems would be a lot simpler if we could rely on the network to deliver packets with a fixed maximum delay and to not drop packets. Why can't we solve this at the hardware level?
-
-To answer this question, it's interesting to compare datacenter networks to the traditional **fixed-line telephone network**, which is extremely reliable. When you make a phone call, it establishes a **circuit**: a fixed, guaranteed amount of bandwidth is allocated for the call. For example, an ISDN network runs at 4,000 frames per second, allocating 16 bits of space within each frame. Thus, for the duration of the call, each side is guaranteed to be able to send exactly 16 bits of audio data every 250 microseconds.
-
-```mermaid
-graph TB
-    subgraph "Synchronous (Circuit-Switched) Network"
-        A1[Caller A] -->|Reserved 16 bits/<br/>250 μs| S1[Switch 1]
-        S1 --> S2[Switch 2]
-        S2 -->|Reserved 16 bits/<br/>250 μs| B1[Caller B]
-        Note1[Bounded delay guaranteed]
-    end
-
-    subgraph "Asynchronous (Packet-Switched) Network"
-        A2[Node A] -->|Packets jostle<br/>for bandwidth| S3[Router]
-        S3 -->|Queue and forward| S4[Router]
-        S4 --> B2[Node B]
-        Note2[Unbounded delay possible]
-    end
-
-    style S1 fill:#90EE90
-    style S2 fill:#90EE90
-    style Note1 fill:#90EE90
-    style S3 fill:#ffcccc
-    style S4 fill:#ffcccc
-    style Note2 fill:#ffcccc
-```
-
-A circuit in a telephone network is very different from a TCP connection:
-- A **circuit** has a fixed amount of reserved bandwidth that nobody else can use
-- A **TCP connection** opportunistically uses whatever network bandwidth is available
-
-If datacenter networks were circuit-switched, it would be possible to establish a guaranteed maximum round-trip time. However, they are not. Ethernet and IP are packet-switched protocols, which suffer from queueing and unbounded delays.
-
-**Variable delays in networks are not a law of nature but simply the result of a cost/benefit trade-off.** Latency guarantees are achievable in certain environments if resources are statically partitioned, but these guarantees come at the cost of reduced utilization - in other words, it is more expensive.
+Datacenter networks would be a lot simpler if we could rely on them to deliver packets with a fixed maximum delay and to not drop packets. The historical reason this is hard: traditional **fixed-line telephone networks** are circuit-switched (a circuit reserves a fixed amount of bandwidth for the duration of a call), whereas Ethernet and IP are packet-switched - they opportunistically use whatever bandwidth is available, which is why queueing and unbounded delays occur. Latency guarantees are achievable if resources are statically partitioned, but those guarantees come at the cost of reduced utilization, which makes them more expensive.
 
 ---
 
@@ -516,23 +494,7 @@ class Clock:
 
 ### Clock Skew vs. Clock Drift
 
-Two distinct issues affect distributed clocks:
-
-```mermaid
-graph LR
-    A[Clock A<br/>t = 100.0] -->|Network| B[Clock B<br/>t = 100.003]
-    B -->|3 ms skew| A
-
-    C[Clock A<br/>t = 100.0] -->|+5 ppm/s| D[Clock A<br/>t = 100.43<br/>1 day later]
-
-    style A fill:#87CEEB
-    style B fill:#87CEEB
-    style C fill:#FFD700
-    style D fill:#FFD700
-```
-
-- **Clock skew**: The instantaneous difference between two clocks at a given point in time. The 3 ms skew in the figure.
-- **Clock drift**: The rate at which a clock deviates from the true time. A 200 ppm drift means the clock gains or loses 200 microseconds per second.
+Two distinct issues affect distributed clocks. **Clock skew** is the instantaneous difference between two clocks at a given point in time (e.g., 3 ms apart). **Clock drift** is the rate at which a clock deviates from the true time - a 200 ppm drift means the clock gains or loses 200 microseconds per second.
 
 Google assumes a clock drift of up to **200 ppm** for its servers, equivalent to:
 - 6 ms drift for a clock resynchronized every 30 seconds
@@ -750,32 +712,6 @@ Is it reasonable to assume that a thread might be paused for so long? **Unfortun
 | **Paging/swapping** | A simple memory access may result in a page fault requiring disk I/O |
 | **SIGSTOP signal** | A Unix process can be paused by sending it the SIGSTOP signal (Ctrl-Z) |
 
-```mermaid
-graph TB
-    A[Process Pause Sources] --> B[Thread Contention]
-    A --> C[Garbage<br/>Collection]
-    A --> D[VM<br/>Suspension]
-    A --> E[OS Context<br/>Switch]
-    A --> F[Disk I/O<br/>or Paging]
-    A --> G[SIGSTOP<br/>Signal]
-
-    B --> H[Arbitrary<br/>delay]
-    C --> H
-    D --> H
-    E --> H
-    F --> H
-    G --> H
-
-    style A fill:#ffcccc
-    style B fill:#FFA500
-    style C fill:#FFA500
-    style D fill:#FFA500
-    style E fill:#FFA500
-    style F fill:#FFA500
-    style G fill:#FFA500
-    style H fill:#ffcccc
-```
-
 All these occurrences can preempt the running thread at any point and resume it at a later time, without the thread even noticing. The problem is similar to making multithreaded code on a single machine thread-safe; you can't assume anything about timing.
 
 > "A node in a distributed system must assume that its execution can be paused for a significant length of time at any point, even in the middle of a function. During the pause, the rest of the world keeps moving and may even declare the paused node dead."
@@ -795,7 +731,7 @@ Providing real-time guarantees requires support from all levels of the software 
 - Real-time garbage collectors exist, but the application must ensure it doesn't give the GC too much work
 - An enormous amount of testing and measurement is required
 
-> "Real-time is not the same as high-performance. In fact, real-time systems may have lower throughput, since they have to prioritize timely responses above all else."
+> "Real-time is not the same as high-performance. Real-time systems may have lower throughput, since they have to prioritize timely responses above all else."
 
 For most server-side data processing systems, real-time guarantees are simply not economical or appropriate. These systems must suffer the pauses and clock instability that come from operating in a non-real-time environment.
 
@@ -825,31 +761,7 @@ A more extreme approach is to treat GC pauses like brief planned outages of a no
 
 ---
 
-## 8. Knowledge, Truth, and Lies
-
-Distributed systems have no shared memory, only message passing via an unreliable network with variable delays, and the systems may suffer from partial failures, unreliable clocks, and processing pauses.
-
-A node in the network cannot know anything for sure about other nodes - it can only make guesses based on the messages it receives (or doesn't receive). A node can find out another node's state only by exchanging messages with it. If a remote node doesn't respond, there is no way of knowing its state.
-
-Discussions of these systems border on the philosophical: What do we know to be true or false in our system? How sure can we be of that knowledge, if the mechanisms for perception and measurement are unreliable?
-
-```mermaid
-graph TB
-    A[Node A's<br/>Perception] -->|"guesses based<br/>on messages"| B[About Node B]
-    B -->|"might be true,<br/>false, or unknown"| C[Ground Truth]
-
-    A -.->|"can't directly<br/>observe"| C
-
-    style A fill:#87CEEB
-    style B fill:#ffeb3b
-    style C fill:#FFD700
-```
-
-Fortunately, we don't need to go as far as figuring out the meaning of life. In a distributed system, we can **state the assumptions** we are making about the behavior (the system model) and design the actual system in such a way that it meets those assumptions. Algorithms can be proved to function correctly within a certain system model. This means that reliable behavior is achievable, even if the underlying system model provides very few guarantees.
-
----
-
-## 9. The Majority Rules
+## 8. The Majority Rules
 
 Imagine a network with an asymmetric fault: a node is able to receive all messages sent to it, but any outgoing messages from that node are dropped or delayed. Even though that node is working perfectly well and is receiving requests from other nodes, the other nodes cannot hear its responses. After a timeout, the other nodes declare it dead.
 
@@ -898,7 +810,9 @@ A majority quorum allows the system to continue working if a minority of nodes a
 
 ---
 
-## 10. Distributed Locks and Leases
+## 9. Distributed Locks and Leases
+
+> **See also:** Chapter 10 (Consistency and Consensus) is the canonical home for **fencing tokens**, **lock services** (Chubby, ZooKeeper, etcd, Consul), and the full equivalence proof between fencing and consensus. This section gives the motivating case; Chapter 10 covers the protocols.
 
 Locks and leases in distributed applications are prone to misuse and are a common source of bugs. Let's look at one particular case of how they can go wrong.
 
@@ -958,7 +872,7 @@ The term **zombie** is sometimes used to describe a former leaseholder that has 
 
 Some systems attempt to fence off zombies by shutting them down - for example, by disconnecting them from the network, shutting down the VM, or physically powering down the machine (sometimes known as "shoot the other node in the head" or STONITH). This approach is not particularly effective: it does not protect against large network delays, all the nodes could shut one another down, and by the time a zombie has been detected and shut down, it may be too late.
 
-A more robust fencing solution is **fencing tokens**:
+A more robust fencing solution is **fencing tokens** (full treatment in Chapter 10):
 
 ```mermaid
 sequenceDiagram
@@ -1113,7 +1027,7 @@ The fundamental issue is that Redlock makes **synchronous assumptions** about ti
 
 ---
 
-## 11. Byzantine Faults
+## 10. Byzantine Faults
 
 Fencing tokens can detect and block a node that is inadvertently acting in error (e.g., because it hasn't yet found out that its lease has expired). However, if the node deliberately wanted to subvert the system's guarantees, it could easily do so by sending messages with a fake fencing token.
 
@@ -1200,7 +1114,7 @@ A bug in the software could be regarded as a Byzantine fault, but if you deploy 
 
 ---
 
-## 12. System Model and Reality
+## 11. System Model and Reality
 
 Many algorithms have been designed to solve distributed systems problems. In order to be useful, these algorithms need to tolerate the various faults we discussed. Algorithms must be written in a way that does not depend too heavily on the details of the hardware and software configuration on which they are run. This requires that we **formalize the kinds of faults** that we expect to happen in a system by defining a **system model**, which is an abstraction that describes an algorithm's assumptions.
 
@@ -1230,7 +1144,7 @@ graph TB
 
 - **Synchronous model**: Assumes bounded network delay, bounded process pauses, and bounded clock error. Not realistic for most practical systems because unbounded delays and pauses do occur.
 - **Partially synchronous model**: The system behaves like a synchronous system most of the time, but it sometimes exceeds the bounds. **Realistic model of many systems.**
-- **Asynchronous model**: An algorithm is not allowed to make any timing assumptions - in fact, it does not even have a clock. Very restrictive.
+- **Asynchronous model**: An algorithm is not allowed to make any timing assumptions - it does not even have a clock. Very restrictive.
 
 ### Node Failure Models
 
@@ -1320,11 +1234,11 @@ That is not to say that theoretical, abstract system models are worthless - quit
 
 ---
 
-## 13. Formal Methods and Randomized Testing
+## 12. Formal Methods and Randomized Testing
 
 How do we know that an algorithm satisfies the required properties? Because of concurrency, partial failures, and network delays, there are a huge number of potential states. We need to guarantee that the properties hold in every possible state and ensure that we haven't forgotten about any edge cases.
 
-### Model Checking and Specification Languages
+### Model Checking
 
 **Model checkers** are tools that help verify that an algorithm or system behaves as expected. An algorithm specification is written in a purpose-built language such as **TLA+**, **Gallina**, or **FizzBee**. Model checkers then use these models to verify that invariants hold across all of an algorithm's states by systematically trying all the things that could happen.
 
@@ -1350,13 +1264,11 @@ MonotonicTokens ==
 \* Specified using temporal logic: <>(\A r \in Resources: HoldersReady(r))
 ```
 
-CockroachDB, TiDB, Kafka, and many other distributed systems use model specifications to find and fix bugs. For example, using TLA+, researchers were able to demonstrate the potential for data loss in viewstamped replication (VR) caused by ambiguity in the prose description of the algorithm.
-
-By design, model checkers don't run your actual code, but rather a simplified model that specifies only the core ideas of your protocol. This makes it more tractable to systematically explore the state space, but it risks that your specification and your implementation go out of sync with each other.
+CockroachDB, TiDB, Kafka, and many other distributed systems use model specifications to find and fix bugs. By design, model checkers don't run your actual code, but rather a simplified model that specifies only the core ideas of your protocol - making the state space tractable but risking drift between the spec and the implementation.
 
 ### Fault Injection
 
-Many bugs are triggered when machine and network failures occur. **Fault injection** is an effective (and sometimes scary) technique that verifies whether a system's implementation works as expected when things go wrong. The idea is simple: inject faults into a running system's environment and see how it behaves.
+Many bugs are triggered when machine and network failures occur. **Fault injection** verifies whether a system's implementation works as expected when things go wrong: inject faults into a running system's environment and observe its behavior.
 
 ```python
 import random
@@ -1396,170 +1308,45 @@ class FaultInjector:
             clock.inject_skew(skew)
 ```
 
-Netflix popularized production fault injection with its **Chaos Monkey** tool. Jepsen has been remarkably effective at finding critical bugs in many widely used systems.
-
-### Jepsen Testing Code Example
-
-Jepsen is a popular library for testing distributed systems. Here's a simplified example of what a Jepsen test looks like:
-
-```clojure
-;; Jepsen test sketch (Clojure)
-(ns jepsen.tests.fencing
-  (:require [jepsen.cli :as cli]
-            [jepsen.core :as core]
-            [jepsen.db :as db]
-            [jepsen.generator :as gen]
-            [jepsen.tests.cyclonus :as cyclonus]
-            [jepsen.nemesis :as nemesis]
-            [jepsen.checker :as checker]))
-
-(def r   "register") ; The resource we're protecting
-(def nemesis
-  (nemesis/partition-random-halves))
-
-(defn fencing-test []
-  (core/run!
-    {:name    "fencing-token-test"
-     :db      db
-     :nemesis nemesis
-     :generator (gen/mix [;; Reads
-                          {:f :read, :value (rand-int 100)}
-                          ;; Writes (acquire lease, then write)
-                          {:f :acquire, :resource r}
-                          {:f :write,   :resource r, :token (:token prev)}
-                          ;; Releases
-                          {:f :release, :resource r}])
-     :checker  (checker/compose
-                 {:perf     (checker/perf)
-                  :correctness (checker/set-full-throttle
-                                 {:linearizable? (checker/linearizable)})})}))
-```
+Netflix popularized production fault injection with its **Chaos Monkey** tool. **Jepsen** is a widely used library for testing distributed databases - injecting partitions and clock skew, then checking that history matches what a linearizable system would have produced.
 
 ### Deterministic Simulation Testing
 
-**Deterministic simulation testing (DST)** uses a similar state space exploration process to a model checker, but it tests your actual code, not a model. In DST, a simulation automatically runs through a large number of randomized executions of the system. Network communication, I/O, and clock timing during the simulation are all replaced with mocks that allow the simulator to control the exact order in which things happen.
+**Deterministic simulation testing (DST)** uses a similar state-space exploration process to a model checker, but it tests your actual code, not a model. Network communication, I/O, and clock timing are replaced with mocks so the simulator controls the exact order of events. Sources of determinism:
 
-```mermaid
-graph TB
-    A[Determinism Strategies] --> B[Application-level<br/>FoundationDB, TigerBeetle]
-    A --> C[Runtime-level<br/>FrostDB, MadSim]
-    A --> D[Machine-level<br/>Antithesis]
+- **Application-level**: FoundationDB uses an async library called Flow with deterministic network simulation; TigerBeetle models state as a state machine with all mutations in a single event loop.
+- **Runtime-level**: FrostDB patches Go's runtime to execute goroutines sequentially; Rust's MadSim provides deterministic implementations of Tokio, S3, Kafka libraries.
+- **Machine-level**: Antithesis uses a custom hypervisor to replace nondeterministic operations with deterministic ones.
 
-    B --> E[Deterministic<br/>system under test]
-    C --> E
-    D --> E
-
-    E --> F[Replayable<br/>failures]
-    E --> G[Fast simulation<br/>(faster than wall clock)]
-    E --> H[Full state<br/>space exploration]
-
-    style A fill:#87CEEB
-    style B fill:#90EE90
-    style C fill:#90EE90
-    style D fill:#90EE90
-    style E fill:#FFD700
-```
-
-DST requires the simulator to be able to control all sources of nondeterminism:
-- **Application-level**: Some systems are built from the ground up to be deterministic. FoundationDB uses an async library called Flow with deterministic network simulation. TigerBeetle's state is modeled as a state machine with all mutations in a single event loop.
-- **Runtime-level**: Languages with asynchronous runtimes provide insertion points. FrostDB patches Go's runtime to execute goroutines sequentially. Rust's MadSim provides deterministic implementations of Tokio, S3, Kafka libraries.
-- **Machine-level**: An entire machine can be made deterministic via a custom hypervisor. Tools like Antithesis replace nondeterministic operations with deterministic ones at the hypervisor level.
-
-DST provides several advantages beyond replayability. For example, Antithesis attempts to explore many paths in application code by branching a test execution into multiple subexecutions when it discovers less common behavior. TigerBeetle's time abstraction allows simulations to simulate network latency and timeouts without actually taking the full length of time.
-
-### The Power of Determinism
+DST adds replayability, branching exploration (Antithesis forks an execution when it spots rare behavior), and faster-than-wall-clock simulation (TigerBeetle's time abstraction simulates latency without waiting).
 
 > "Nondeterminism is at the core of all the distributed systems challenges we discussed in this chapter: concurrency, network delay, process pauses, clock jumps, and crashes all happen in unpredictable ways that vary from one run of a system to the next. Conversely, if you can make a system deterministic, that can hugely simplify things."
 
-Throughout the book, we have seen several ways of using determinism:
-- **Event sourcing** allows you to deterministically replay a log of events
-- **Workflow engines** rely on workflow definitions being deterministic
-- **State machine replication** replicates data by independently executing the same sequence of deterministic transactions on each replica
-
-However, making code fully deterministic requires care. Even once you have removed all concurrency and replaced I/O, network communication, clocks, and random number generators with deterministic simulations, elements of nondeterminism may remain. For example, in some programming languages, the order in which you iterate over the elements of a hash table may be nondeterministic.
+Throughout the book, we have seen several ways of using determinism: **event sourcing** lets you deterministically replay a log of events; **workflow engines** rely on workflow definitions being deterministic; **state machine replication** replicates data by independently executing the same sequence of deterministic transactions on each replica. However, making code fully deterministic requires care - even with concurrency removed and I/O, network, clocks, and RNGs mocked, iteration order over hash tables may still be nondeterministic in some languages.
 
 ---
 
 ## Summary
 
-In this chapter we have discussed a wide range of problems that can occur in distributed systems:
+This chapter has been all about problems. A distributed system can in principle run forever at the service level, because all faults and maintenance can be handled at the node level - but achieving that requires confronting partial failures, unreliable clocks, process pauses, and the limits of knowledge in a distributed world.
 
-```mermaid
-graph TB
-    A[Trouble with<br/>Distributed Systems] --> B[Unreliable Networks]
-    A --> C[Unreliable Clocks]
-    A --> D[Process Pauses]
-    A --> E[Knowledge & Truth]
-    A --> F[Byzantine Faults]
+Key takeaways:
 
-    B --> B1[Packet loss,<br/>delay, partitions]
-    B --> B2[TCP limitations]
-    B --> B3[Unbounded delays]
-
-    C --> C1[Time-of-day vs.<br/>monotonic]
-    C --> C2[NTP drift & errors]
-    C --> C3[Confidence intervals]
-
-    D --> D1[GC pauses]
-    D --> D2[VM suspension]
-    D --> D3[Context switches]
-
-    E --> E1[Quorum decisions]
-    E --> E2[Fencing tokens]
-    E --> E3[Zombies]
-
-    F --> F1[Malicious nodes]
-    F --> F2[Hardware corruption]
-
-    style A fill:#87CEEB
-    style B fill:#ffcccc
-    style C fill:#ffcccc
-    style D fill:#ffcccc
-    style E fill:#ffcccc
-    style F fill:#ffcccc
-    style B1 fill:#FFA500
-    style B2 fill:#FFA500
-    style B3 fill:#FFA500
-    style C1 fill:#FFA500
-    style C2 fill:#FFA500
-    style C3 fill:#FFA500
-    style D1 fill:#FFA500
-    style D2 fill:#FFA500
-    style D3 fill:#FFA500
-    style E1 fill:#FFA500
-    style E2 fill:#FFA500
-    style E3 fill:#FFA500
-    style F1 fill:#FFA500
-    style F2 fill:#FFA500
-```
-
-### Key Takeaways
-
-1. **Partial failures are the defining characteristic of distributed systems.** Whenever software tries to do anything involving other nodes, there is the possibility that it may occasionally fail, or randomly go slow, or not respond at all.
-
+1. **Partial failures are the defining characteristic of distributed systems.** Whenever software tries to do anything involving other nodes, it may occasionally fail, randomly go slow, or not respond at all.
 2. **Networks are unreliable.** Packets may be lost or arbitrarily delayed. If you don't get a reply, you have no idea whether the message got through. Timeouts can't distinguish between network and node failures, and variable network delay sometimes causes a node to be falsely suspected of crashing.
-
 3. **Clocks are unreliable.** A node's clock may be significantly out of sync with other nodes, may suddenly jump forward or back in time, and relying on it is dangerous because you most likely don't have a good measure of your clock's confidence interval.
-
 4. **Processes can pause.** A process may pause for a substantial amount of time at any point in its execution, be declared dead by other nodes, and then come back to life again without realizing that it was paused.
-
 5. **There is no global knowledge.** Nodes can't even agree on what time it is, let alone on anything more profound. The only way information can flow from one node to another is by sending it over the unreliable network.
-
 6. **Use quorums for important decisions.** Major decisions cannot be safely made by a single node; require protocols that enlist help from other nodes and get a quorum to agree.
-
-7. **Fencing tokens protect against zombies.** When using distributed locks or leases, fencing tokens prevent former leaseholders from corrupting data after their lease has expired.
-
+7. **Fencing tokens protect against zombies.** When using distributed locks or leases, fencing tokens prevent former leaseholders from corrupting data after their lease has expired - see Chapter 10 for the canonical treatment.
 8. **Choose your system model carefully.** The partially synchronous model with crash-recovery faults is usually the most realistic for production systems.
-
 9. **Test with fault injection and DST.** Don't trust that your distributed system works correctly - prove it with property-based testing, model checking, and deterministic simulation testing.
 
-### What Comes Next
-
-This chapter has been all about problems, and it has presented us a bleak outlook. We gain a lot by using extensively tested, production-grade distributed systems that manage these problems. In the next chapter we will move on to solutions and discuss some algorithms such systems employ to cope with these issues.
+In the next chapter we move on to solutions and discuss algorithms such systems employ to cope with these issues.
 
 ```mermaid
 graph LR
-    A[Chapter 8/9:<br/>Problems] -->|solutions<br/>in next chapter| B[Chapter 9/10:<br/>Consistency<br/>& Consensus]
+    A[Chapter 9:<br/>Problems] -->|solutions<br/>in next chapter| B[Chapter 10:<br/>Consistency<br/>& Consensus]
     B -->|replication,<br/>transactions| C[Reliable<br/>Systems]
 
     style A fill:#ffcccc
@@ -1568,8 +1355,6 @@ graph LR
 ```
 
 > "If you're used to writing software in the idealized mathematical perfection of a single computer, where the same operation always deterministically returns the same result, then moving to the messy physical reality of distributed systems can be a bit of a shock. Conversely, distributed systems engineers will often regard a problem as trivial if it can be solved on a single computer."
-
-The power of distributed systems is that in principle, they can run forever without being interrupted at the service level, because all faults and maintenance can be handled at the node level. But as we've seen throughout this chapter, achieving that power requires confronting partial failures, unreliable clocks, process pauses, and the limits of knowledge in a distributed world.
 
 ---
 
