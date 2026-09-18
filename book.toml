@@ -1,0 +1,7 @@
+[book]
+title = "Designing Data-Intensive Applications"
+description = "Chapter-by-chapter breakdown of \"Designing Data-Intensive Applications\" by Martin Kleppmann (2nd edition)."
+authors = ["shpsi"]
+src = "."
+language = "en"
+multilingual = false
